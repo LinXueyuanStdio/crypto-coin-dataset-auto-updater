@@ -32,7 +32,7 @@ jobs:
       - name: Clone the dataset repository
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: git clone https://huggingface.co/datasets/linxy/CryptoCoin data
+        run: git clone https://hf_user:${HF_TOKEN}@huggingface.co/datasets/linxy/CryptoCoin data
 
       - name: Setup Proxy
         run: |
