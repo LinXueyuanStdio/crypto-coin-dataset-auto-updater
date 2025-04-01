@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "crypto-coin-dataset-auto-updater"
-version = "0.1.0"
+version = "1.0.0"
 description = "Automatically update cryptocurrency datasets on Huggingface with Binance official data."
 authors = ["Xueyuan Lin <linxy59@mail2.sysu.edu.cn>"]
 license = "MIT"
