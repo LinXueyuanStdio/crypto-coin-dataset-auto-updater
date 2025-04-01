@@ -198,11 +198,11 @@ def main():
     # copy_metadata(DATA_FOLDER, MERGED_FOLDER)
 
     # Step 5: Upload updated datasets from MERGED_FOLDER with a retry loop until successful
-    current_date = datetime.now().strftime("%B, %d %Y")
+    current_date = datetime.now().strftime("%B, %d %Y, %H:%M:%S")
     upload_successful = False
     while not upload_successful:
         try:
-            upload(MERGED_FOLDER, dataset_slug, f"Update {current_date}")
+            upload(MERGED_FOLDER, dataset_slug, f"Updated at {current_date}")
             upload_successful = True
         except Exception as e:
             print(f"Upload failed: {e}. Retrying in 60 seconds...")
