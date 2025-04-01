@@ -7,6 +7,7 @@ from datetime import datetime
 from binance.client import Client
 from dotenv import load_dotenv
 from huggingface_hub import HfApi
+from xlin import cp
 # Load environment variables
 load_dotenv()
 
@@ -196,6 +197,7 @@ def main():
 
     # Copy metadata file from DATA_FOLDER to MERGED_FOLDER so that Hf API finds it
     # copy_metadata(DATA_FOLDER, MERGED_FOLDER)
+    cp(MERGED_FOLDER, DATA_FOLDER, filter=lambda f: f.endswith(".csv"), force_overwrite=True, verbose=True)
 
     # Step 5: Upload updated datasets from MERGED_FOLDER with a retry loop until successful
     current_date = datetime.now().strftime("%B, %d %Y, %H:%M:%S")
