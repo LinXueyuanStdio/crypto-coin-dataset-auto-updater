@@ -204,7 +204,7 @@ def main():
     upload_successful = False
     while not upload_successful:
         try:
-            upload(MERGED_FOLDER, dataset_slug, f"Updated at {current_date}")
+            upload(DATA_FOLDER, dataset_slug, f"Updated at {current_date}")
             upload_successful = True
         except Exception as e:
             print(f"Upload failed: {e}. Retrying in 60 seconds...")
