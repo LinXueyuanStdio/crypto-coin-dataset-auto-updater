@@ -15,6 +15,7 @@ python-binance = "^1.0.27"
 python-dotenv = "^1.0.1"
 PySocks = "^1.7.1"
 Huggingface_hub = "^0.30.1"
+xlin = "^0.1.14"
 
 [build-system]
 requires = ["poetry-core"]
