@@ -5,7 +5,7 @@ description = "Automatically update cryptocurrency datasets on Huggingface with 
 authors = ["Xueyuan Lin <linxy59@mail2.sysu.edu.cn>"]
 license = "MIT"
 readme = "README.md"
-packages = [{include = "updater"}]
+packages = [{include = "updater.py"}]
 
 [tool.poetry.dependencies]
 python = "^3.10"
