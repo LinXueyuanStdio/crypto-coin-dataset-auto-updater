@@ -8,6 +8,7 @@ from binance.client import Client
 from dotenv import load_dotenv
 from huggingface_hub import HfApi
 from xlin import cp, rm
+
 # Load environment variables
 load_dotenv()
 
@@ -16,16 +17,14 @@ BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 
 # Configure proxy settings (will be used for Binance API calls)
-proxies = {
-    'http': os.getenv('HTTP_PROXY'),
-    'https': os.getenv('HTTPS_PROXY')
-}
+proxies = {"http": os.getenv("HTTP_PROXY"), "https": os.getenv("HTTPS_PROXY")}
+
 
 def create_binance_client(max_retries=3):
     """Create Binance client with retry logic."""
     local_proxies = {
-        'http': os.getenv('HTTP_PROXY'),
-        'https': os.getenv('HTTPS_PROXY')
+        "http": os.getenv("HTTP_PROXY"),
+        "https": os.getenv("HTTPS_PROXY"),
     }
 
     for attempt in range(max_retries):
@@ -34,10 +33,10 @@ def create_binance_client(max_retries=3):
                 BINANCE_API_KEY,
                 BINANCE_API_SECRET,
                 {
-                    'proxies': local_proxies,
-                    'timeout': 30,
-                    'verify': True
-                }
+                    "proxies": local_proxies,
+                    "timeout": 30,
+                    "verify": True,
+                },
             )
             # Test the connection
             client.ping()
@@ -48,10 +47,11 @@ def create_binance_client(max_retries=3):
             if attempt < max_retries - 1:
                 print("Waiting 10 seconds before retry...")
                 time.sleep(10)
-                os.system('sudo service tor restart')
+                os.system("sudo service tor restart")
                 time.sleep(5)
             else:
                 raise
+
 
 # Initialize Binance client
 client = create_binance_client()
@@ -62,6 +62,7 @@ DATA_FOLDER = os.path.join(BASE_DIR, "data")
 NEW_DATA_FOLDER = os.path.join(BASE_DIR, "new_data")
 MERGED_FOLDER = os.path.join(BASE_DIR, "merged_data")  # New folder for merged files
 
+
 def clean_folder(folder_path):
     """Clean the specified folder."""
     for file in os.listdir(folder_path):
@@ -69,6 +70,7 @@ def clean_folder(folder_path):
         if os.path.isfile(file_path):
             os.remove(file_path)
     print(f"Cleaned folder: {folder_path}")
+
 
 def download_dataset(dataset_slug, output_dir):
     """Download the dataset."""
@@ -84,20 +86,42 @@ def download_dataset(dataset_slug, output_dir):
     )
     print(f"Dataset downloaded to {output_dir}")
 
-def fetch_binance_data(symbol, interval, start_date, end_date, output_file, max_retries=3):
+
+def fetch_binance_data(
+    symbol,
+    interval,
+    start_date,
+    end_date,
+    output_file,
+    max_retries=3,
+):
     """Fetch historical data from Binance with retry logic."""
     for attempt in range(max_retries):
         try:
             client = create_binance_client()
-            klines = client.get_historical_klines(symbol, interval, start_date, end_date)
+            klines = client.get_historical_klines(
+                symbol,
+                interval,
+                start_date,
+                end_date,
+            )
             columns = [
-                'Open time', 'open', 'high', 'low', 'close', 'volume',
-                'Close time', 'Quote asset volume', 'Number of trades',
-                'Taker buy base asset volume', 'Taker buy quote asset volume', 'Ignore'
+                "Open time",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "Close time",
+                "Quote asset volume",
+                "Number of trades",
+                "Taker buy base asset volume",
+                "Taker buy quote asset volume",
+                "Ignore",
             ]
             df = pd.DataFrame(klines, columns=columns)
-            df['Open time'] = pd.to_datetime(df['Open time'], unit='ms')
-            df['Close time'] = pd.to_datetime(df['Close time'], unit='ms')
+            df["Open time"] = pd.to_datetime(df["Open time"], unit="ms")
+            df["Close time"] = pd.to_datetime(df["Close time"], unit="ms")
             df.to_csv(output_file, index=False)
             print(f"Fetched data saved to {output_file}")
             return
@@ -106,34 +130,45 @@ def fetch_binance_data(symbol, interval, start_date, end_date, output_file, max_
             if attempt < max_retries - 1:
                 print("Waiting 20 seconds before retry...")
                 time.sleep(20)
-                os.system('sudo service tor restart')
+                os.system("sudo service tor restart")
                 time.sleep(5)
             else:
-                raise
+                raise Exception(
+                    f"Failed to fetch data for {symbol} at interval {interval} after {max_retries} attempts"
+                )
+
 
 def merge_datasets(existing_file, new_file, output_file):
     """Merge existing and new datasets."""
-    existing_data = pd.read_csv(existing_file)
+    if os.path.exists(existing_file):
+        existing_data = pd.read_csv(existing_file)
+    else:
+        columns = [
+            "Open time",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "Close time",
+            "Quote asset volume",
+            "Number of trades",
+            "Taker buy base asset volume",
+            "Taker buy quote asset volume",
+            "Ignore",
+        ]
+        existing_data = pd.DataFrame([], columns=columns)
     new_data = pd.read_csv(new_file)
 
     # Ensure Open time is datetime
-    existing_data['Open time'] = pd.to_datetime(existing_data['Open time'])
-    new_data['Open time'] = pd.to_datetime(new_data['Open time'])
+    existing_data["Open time"] = pd.to_datetime(existing_data["Open time"])
+    new_data["Open time"] = pd.to_datetime(new_data["Open time"])
 
     merged_data = pd.concat([existing_data, new_data])
-    merged_data.drop_duplicates(subset='Open time', inplace=True)
-    merged_data.sort_values(by='Open time', inplace=True)
+    merged_data.drop_duplicates(subset="Open time", inplace=True)
+    merged_data.sort_values(by="Open time", inplace=True)
     merged_data.to_csv(output_file, index=False)
     print(f"Merged dataset saved to {output_file}")
-
-def copy_metadata(src_folder, dest_folder):
-    """Copy the metadata file to the destination folder."""
-    metadata_file = os.path.join(src_folder, "dataset-metadata.json")
-    if os.path.exists(metadata_file):
-        shutil.copy(metadata_file, dest_folder)
-        print(f"Copied metadata file from {metadata_file} to {dest_folder}")
-    else:
-        print(f"Metadata file not found in {src_folder}")
 
 
 def upload(upload_folder, dataset_slug, version_notes):
@@ -159,6 +194,7 @@ def upload(upload_folder, dataset_slug, version_notes):
         if original_https_proxy:
             os.environ["HTTPS_PROXY"] = original_https_proxy
 
+
 def main():
     dataset_slug = "linxy/CryptoCoin"
     os.makedirs(DATA_FOLDER, exist_ok=True)
@@ -174,30 +210,59 @@ def main():
     # download_dataset(dataset_slug, DATA_FOLDER)
 
     # Step 3: Fetch new data for all timeframes
-    start_date = "2025-01-01"
+    # past 10 years
+    start_date = (datetime.now() - pd.DateOffset(years=10)).strftime("%Y-%m-%d")
     end_date = datetime.now().strftime("%Y-%m-%d")
-    end_year = datetime.now().year
     timeframes = {
-        "15m": Client.KLINE_INTERVAL_15MINUTE,
-        "1h": Client.KLINE_INTERVAL_1HOUR,
+        # "1M": Client.KLINE_INTERVAL_1MONTH,
+        # "1w": Client.KLINE_INTERVAL_1WEEK,
+        # "3d": Client.KLINE_INTERVAL_3DAY,
+        "1d": Client.KLINE_INTERVAL_1DAY,
+        "12h": Client.KLINE_INTERVAL_12HOUR,
+        "8h": Client.KLINE_INTERVAL_8HOUR,
+        "6h": Client.KLINE_INTERVAL_6HOUR,
         "4h": Client.KLINE_INTERVAL_4HOUR,
-        "1d": Client.KLINE_INTERVAL_1DAY
+        "2h": Client.KLINE_INTERVAL_2HOUR,
+        "1h": Client.KLINE_INTERVAL_1HOUR,
+        "30m": Client.KLINE_INTERVAL_30MINUTE,
+        "15m": Client.KLINE_INTERVAL_15MINUTE,
+        "5m": Client.KLINE_INTERVAL_5MINUTE,
+        "3m": Client.KLINE_INTERVAL_3MINUTE,
+        "1m": Client.KLINE_INTERVAL_1MINUTE,
+        # "1s": Client.KLINE_INTERVAL_1SECOND,
     }
-
-    for tf_name, tf_interval in timeframes.items():
-        output_file = os.path.join(NEW_DATA_FOLDER, f"{tf_name}.csv")
-        fetch_binance_data("BTCUSDT", tf_interval, start_date, end_date, output_file)
+    available_pairs = [
+        '1INCHUSDT', 'AAVEUSDT', 'ADAUSDT', 'ALGOUSDT', 'AVAXUSDT',
+        'BATUSDT', 'BCHUSDT', 'BNBUSDT', 'BTCUSDT', 'CHZUSDT',
+        'COMPUSDT', 'CRVUSDT', 'DOGEUSDT', 'DOTUSDT', 'EOSUSDT',
+        'ETCUSDT', 'ETHUSDT', 'FILUSDT', 'FTMUSDT', 'FTTUSDT',
+        'HBARUSDT', 'HNTUSDT', 'ICPUSDT', 'KSMUSDT', 'LDOUSDT',
+        'LINKUSDT', 'LTCUSDT', 'LUNAUSDT', 'MANAUSDT', 'MATICUSDT',
+        'RUNEUSDT', 'SANDUSDT', 'SHIBUSDT', 'SNXUSDT', 'SOLUSDT',
+        'SUSHIUSDT', 'TRXUSDT', 'UNIUSDT', 'WAVESUSDT', 'XEMUSDT',
+        'XLMUSDT', 'XRPUSDT', 'YFIUSDT', 'ZILUSDT', 'ZRXUSDT',
+    ]
+    for pair in available_pairs:
+        for tf_name, tf_interval in timeframes.items():
+            new_file = os.path.join(NEW_DATA_FOLDER, f"{pair}_{tf_name}.csv")
+            fetch_binance_data(pair, tf_interval, start_date, end_date, new_file)
 
     # Step 4: Merge new data with old datasets and save the merged files in MERGED_FOLDER
-    for tf_name, _ in timeframes.items():
-        old_file = os.path.join(DATA_FOLDER, f"btc_{tf_name}_data_2018_to_{end_year}.csv")
-        new_file = os.path.join(NEW_DATA_FOLDER, f"{tf_name}.csv")
-        merged_file = os.path.join(MERGED_FOLDER, f"btc_{tf_name}_data_2018_to_{end_year}.csv")
-        merge_datasets(old_file, new_file, merged_file)
+    for pair in available_pairs:
+        for tf_name, _ in timeframes.items():
+            old_file = os.path.join(DATA_FOLDER, f"{pair}_{tf_name}.csv")
+            new_file = os.path.join(NEW_DATA_FOLDER, f"{pair}_{tf_name}.csv")
+            merged_file = os.path.join(MERGED_FOLDER, f"{pair}_{tf_name}.csv")
+            merge_datasets(old_file, new_file, merged_file)
 
     # Copy metadata file from DATA_FOLDER to MERGED_FOLDER so that Hf API finds it
-    # copy_metadata(DATA_FOLDER, MERGED_FOLDER)
-    cp(MERGED_FOLDER, DATA_FOLDER, filter=lambda f: f.name.endswith(".csv"), force_overwrite=True, verbose=True)
+    cp(
+        MERGED_FOLDER,
+        DATA_FOLDER,
+        filter=lambda f: f.name.endswith(".csv"),
+        force_overwrite=True,
+        verbose=True,
+    )
 
     # Step 5: Upload updated datasets from MERGED_FOLDER with a retry loop until successful
     current_date = datetime.now().strftime("%B, %d %Y, %H:%M:%S")
