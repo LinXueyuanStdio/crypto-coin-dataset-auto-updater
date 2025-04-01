@@ -1,0 +1,21 @@
+[tool.poetry]
+name = "crypto-coin-dataset-auto-updater"
+version = "0.1.0"
+description = "Automatically update cryptocurrency datasets on Huggingface with Binance official data."
+authors = ["Xueyuan Lin <linxy59@mail2.sysu.edu.cn>"]
+license = "MIT"
+readme = "README.md"
+packages = [{include = "updater"}]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+pandas = "^2.2.2"
+requests = "^2.32.3"
+python-binance = "^1.0.27"
+python-dotenv = "^1.0.1"
+PySocks = "^1.7.1"
+Huggingface_hub = "^0.30.1"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
