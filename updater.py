@@ -7,7 +7,7 @@ from datetime import datetime
 from binance.client import Client
 from dotenv import load_dotenv
 from huggingface_hub import HfApi
-from xlin import cp
+from xlin import cp, rm
 # Load environment variables
 load_dotenv()
 
@@ -211,9 +211,10 @@ def main():
             time.sleep(60)
 
     # Step 6: Once upload is successful, clean all folders
-    clean_folder(DATA_FOLDER)
-    clean_folder(NEW_DATA_FOLDER)
-    clean_folder(MERGED_FOLDER)
+    rm(DATA_FOLDER, debug=True)
+    rm(NEW_DATA_FOLDER, debug=True)
+    rm(MERGED_FOLDER, debug=True)
+
 
 if __name__ == "__main__":
     max_attempts = 10  # Maximum number of global attempts
