@@ -299,7 +299,6 @@ def main():
 
     for pair in available_pairs:
         for tf_name, _ in timeframes.items():
-            old_file = os.path.join(DATA_FOLDER, f"{pair}_{tf_name}.csv")
             merged_file = os.path.join(MERGED_FOLDER, f"{pair}_{tf_name}.csv")
             cp(merged_file, DATA_FOLDER, force_overwrite=True, verbose=True)
     today = datetime.now()
