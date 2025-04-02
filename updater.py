@@ -7,7 +7,9 @@ from datetime import datetime
 from binance.client import Client
 from dotenv import load_dotenv
 from huggingface_hub import HfApi
-from xlin import cp, rm
+from xlin import cp, rm, element_mapping
+from functools import partial
+import re
 
 # Load environment variables
 load_dotenv()
@@ -17,7 +19,10 @@ BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 
 # Configure proxy settings (will be used for Binance API calls)
-proxies = {"http": os.getenv("HTTP_PROXY"), "https": os.getenv("HTTPS_PROXY")}
+proxies = {
+    "http": os.getenv("HTTP_PROXY"),
+    "https": os.getenv("HTTPS_PROXY"),
+}
 
 
 def create_binance_client(max_retries=3):
@@ -140,31 +145,14 @@ def fetch_binance_data(
 
 def merge_datasets(existing_file, new_file, output_file):
     """Merge existing and new datasets."""
+    new_data = pd.read_csv(new_file)
+    new_data["Open time"] = pd.to_datetime(new_data["Open time"])
     if os.path.exists(existing_file):
         existing_data = pd.read_csv(existing_file)
+        existing_data["Open time"] = pd.to_datetime(existing_data["Open time"])
+        merged_data = pd.concat([existing_data, new_data])
     else:
-        columns = [
-            "Open time",
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume",
-            "Close time",
-            "Quote asset volume",
-            "Number of trades",
-            "Taker buy base asset volume",
-            "Taker buy quote asset volume",
-            "Ignore",
-        ]
-        existing_data = pd.DataFrame([], columns=columns)
-    new_data = pd.read_csv(new_file)
-
-    # Ensure Open time is datetime
-    existing_data["Open time"] = pd.to_datetime(existing_data["Open time"])
-    new_data["Open time"] = pd.to_datetime(new_data["Open time"])
-
-    merged_data = pd.concat([existing_data, new_data])
+        merged_data = new_data
     merged_data.drop_duplicates(subset="Open time", inplace=True)
     merged_data.sort_values(by="Open time", inplace=True)
     merged_data.to_csv(output_file, index=False)
@@ -203,8 +191,8 @@ def main():
 
     # Step 1: Clean folders (do not remove metadata until after successful upload)
     # clean_folder(DATA_FOLDER)
-    clean_folder(NEW_DATA_FOLDER)
-    clean_folder(MERGED_FOLDER)
+    # clean_folder(NEW_DATA_FOLDER)
+    # clean_folder(MERGED_FOLDER)
 
     # Step 2: Download dataset into DATA_FOLDER
     # download_dataset(dataset_slug, DATA_FOLDER)
@@ -227,25 +215,76 @@ def main():
         "30m": Client.KLINE_INTERVAL_30MINUTE,
         "15m": Client.KLINE_INTERVAL_15MINUTE,
         "5m": Client.KLINE_INTERVAL_5MINUTE,
-        "3m": Client.KLINE_INTERVAL_3MINUTE,
-        "1m": Client.KLINE_INTERVAL_1MINUTE,
+        # "3m": Client.KLINE_INTERVAL_3MINUTE,
+        # "1m": Client.KLINE_INTERVAL_1MINUTE,
         # "1s": Client.KLINE_INTERVAL_1SECOND,
     }
     available_pairs = [
-        '1INCHUSDT', 'AAVEUSDT', 'ADAUSDT', 'ALGOUSDT', 'AVAXUSDT',
-        'BATUSDT', 'BCHUSDT', 'BNBUSDT', 'BTCUSDT', 'CHZUSDT',
-        'COMPUSDT', 'CRVUSDT', 'DOGEUSDT', 'DOTUSDT', 'EOSUSDT',
-        'ETCUSDT', 'ETHUSDT', 'FILUSDT', 'FTMUSDT', 'FTTUSDT',
-        'HBARUSDT', 'HNTUSDT', 'ICPUSDT', 'KSMUSDT', 'LDOUSDT',
-        'LINKUSDT', 'LTCUSDT', 'LUNAUSDT', 'MANAUSDT', 'MATICUSDT',
-        'RUNEUSDT', 'SANDUSDT', 'SHIBUSDT', 'SNXUSDT', 'SOLUSDT',
-        'SUSHIUSDT', 'TRXUSDT', 'UNIUSDT', 'WAVESUSDT', 'XEMUSDT',
-        'XLMUSDT', 'XRPUSDT', 'YFIUSDT', 'ZILUSDT', 'ZRXUSDT',
+        "1INCHUSDT",
+        "AAVEUSDT",
+        "ADAUSDT",
+        "ALGOUSDT",
+        "AVAXUSDT",
+        "BATUSDT",
+        "BCHUSDT",
+        "BNBUSDT",
+        "BTCUSDT",
+        "CHZUSDT",
+        "COMPUSDT",
+        "CRVUSDT",
+        "DOGEUSDT",
+        "DOTUSDT",
+        "EOSUSDT",
+        "ETCUSDT",
+        "ETHUSDT",
+        "FILUSDT",
+        "FTMUSDT",
+        "FTTUSDT",
+        "HBARUSDT",
+        "HNTUSDT",
+        "ICPUSDT",
+        "KSMUSDT",
+        "LDOUSDT",
+        "LINKUSDT",
+        "LTCUSDT",
+        "LUNAUSDT",
+        "MANAUSDT",
+        "MATICUSDT",
+        "RUNEUSDT",
+        "SANDUSDT",
+        "SHIBUSDT",
+        "SNXUSDT",
+        "SOLUSDT",
+        "SUSHIUSDT",
+        "TRXUSDT",
+        "UNIUSDT",
+        "WAVESUSDT",
+        "XEMUSDT",
+        "XLMUSDT",
+        "XRPUSDT",
+        "YFIUSDT",
+        "ZILUSDT",
+        "ZRXUSDT",
     ]
+    jobs = []
     for pair in available_pairs:
         for tf_name, tf_interval in timeframes.items():
-            new_file = os.path.join(NEW_DATA_FOLDER, f"{pair}_{tf_name}.csv")
-            fetch_binance_data(pair, tf_interval, start_date, end_date, new_file)
+            jobs.append((pair, tf_name, tf_interval))
+
+    def f(row):
+        pair, tf_name, tf_interval = row
+        new_file = os.path.join(NEW_DATA_FOLDER, f"{pair}_{tf_name}.csv")
+        if os.path.exists(new_file):
+            print(f"File {new_file} already exists. Skipping...")
+            return True, new_file
+        print(f"Fetching data for {pair} at interval {tf_name}...")
+        fetch_binance_data(pair, tf_interval, start_date, end_date, new_file)
+        if pd.read_csv(new_file).empty:
+            print(f"Warning: {new_file} is empty after fetching data.")
+            return False, None
+        return True, new_file
+
+    element_mapping(jobs, f, thread_pool_size=5)
 
     # Step 4: Merge new data with old datasets and save the merged files in MERGED_FOLDER
     for pair in available_pairs:
@@ -253,16 +292,25 @@ def main():
             old_file = os.path.join(DATA_FOLDER, f"{pair}_{tf_name}.csv")
             new_file = os.path.join(NEW_DATA_FOLDER, f"{pair}_{tf_name}.csv")
             merged_file = os.path.join(MERGED_FOLDER, f"{pair}_{tf_name}.csv")
+            if os.path.exists(merged_file):
+                print(f"Merged file {merged_file} already exists. Skipping...")
+                continue
             merge_datasets(old_file, new_file, merged_file)
 
-    # Copy metadata file from DATA_FOLDER to MERGED_FOLDER so that Hf API finds it
-    cp(
-        MERGED_FOLDER,
-        DATA_FOLDER,
-        filter=lambda f: f.name.endswith(".csv"),
-        force_overwrite=True,
-        verbose=True,
+    for pair in available_pairs:
+        for tf_name, _ in timeframes.items():
+            old_file = os.path.join(DATA_FOLDER, f"{pair}_{tf_name}.csv")
+            merged_file = os.path.join(MERGED_FOLDER, f"{pair}_{tf_name}.csv")
+            cp(merged_file, DATA_FOLDER, force_overwrite=True, verbose=True)
+    today = datetime.now()
+    today_str = today.strftime("%Y-%m-%d %H:%M:%S")
+    with open("data/README.md", "r") as file:
+        readme = file.read()
+    readme = re.sub(
+        r"Last updated on `(.*?)`", f"Last updated on `{today_str}`", readme
     )
+    with open("data/README.md", "w") as file:
+        file.write(readme)
 
     # Step 5: Upload updated datasets from MERGED_FOLDER with a retry loop until successful
     current_date = datetime.now().strftime("%B, %d %Y, %H:%M:%S")
@@ -276,9 +324,10 @@ def main():
             time.sleep(60)
 
     # Step 6: Once upload is successful, clean all folders
-    rm(DATA_FOLDER, debug=True)
-    rm(NEW_DATA_FOLDER, debug=True)
-    rm(MERGED_FOLDER, debug=True)
+    # rm(DATA_FOLDER, debug=True)
+    # rm(NEW_DATA_FOLDER, debug=True)
+    # rm(MERGED_FOLDER, debug=True)
+    print("All folders cleaned.")
 
 
 if __name__ == "__main__":
