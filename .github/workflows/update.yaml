@@ -59,6 +59,6 @@ jobs:
           HTTPS_PROXY: "http://127.0.0.1:8118"
         run: |
           until poetry run python updater.py; do
-            echo "Dataset update failed, retrying in 60 seconds..."
-            sleep 60
+            echo "Dataset update failed, retrying in 30 seconds..."
+            sleep 30
           done
