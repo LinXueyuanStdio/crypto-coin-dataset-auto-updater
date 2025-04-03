@@ -156,7 +156,7 @@ def merge_datasets(existing_file, new_file, output_file):
     merged_data.drop_duplicates(subset="Open time", inplace=True)
     merged_data.sort_values(by="Open time", inplace=True)
     merged_data.to_csv(output_file, index=False)
-    print(f"Merged dataset saved to {output_file}")
+    print(f"Merged dataset (from {merged_data['Open time'].min()} to {merged_data['Open time'].max()}) saved to {output_file}")
 
 
 def upload(upload_folder, dataset_slug, version_notes):
@@ -199,7 +199,7 @@ def main():
 
     # Step 3: Fetch new data for all timeframes
     # past 2 days
-    start_date = (datetime.now() - pd.DateOffset(days=2)).strftime("%Y-%m-%d")
+    start_date = (datetime.now() - pd.DateOffset(years=10)).strftime("%Y-%m-%d")
     end_date = datetime.now().strftime("%Y-%m-%d")
     timeframes = {
         # "1M": Client.KLINE_INTERVAL_1MONTH,
@@ -277,7 +277,7 @@ def main():
         if os.path.exists(new_file):
             print(f"File {new_file} already exists. Skipping...")
             return True, new_file
-        print(f"Fetching data for {pair} at interval {tf_name}...")
+        print(f"Fetching data for {pair} at interval {tf_name} from {start_date} to {end_date}")
         fetch_binance_data(pair, tf_interval, start_date, end_date, new_file)
         if pd.read_csv(new_file).empty:
             print(f"Warning: {new_file} is empty after fetching data.")
