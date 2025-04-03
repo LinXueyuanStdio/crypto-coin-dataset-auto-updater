@@ -10,6 +10,7 @@ from huggingface_hub import HfApi
 from xlin import cp, rm, element_mapping
 from functools import partial
 import re
+import multiprocessing
 
 # Load environment variables
 load_dotenv()
@@ -284,7 +285,7 @@ def main():
             return False, None
         return True, new_file
 
-    element_mapping(jobs, f, thread_pool_size=5)
+    element_mapping(jobs, f, thread_pool_size=multiprocessing.cpu_count())
 
     # Step 4: Merge new data with old datasets and save the merged files in MERGED_FOLDER
     for pair in available_pairs:
