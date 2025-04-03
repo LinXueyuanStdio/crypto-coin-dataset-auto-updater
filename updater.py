@@ -198,8 +198,8 @@ def main():
     # download_dataset(dataset_slug, DATA_FOLDER)
 
     # Step 3: Fetch new data for all timeframes
-    # past 10 years
-    start_date = (datetime.now() - pd.DateOffset(years=10)).strftime("%Y-%m-%d")
+    # past 2 days
+    start_date = (datetime.now() - pd.DateOffset(days=2)).strftime("%Y-%m-%d")
     end_date = datetime.now().strftime("%Y-%m-%d")
     timeframes = {
         # "1M": Client.KLINE_INTERVAL_1MONTH,
