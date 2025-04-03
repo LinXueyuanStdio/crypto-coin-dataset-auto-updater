@@ -200,7 +200,7 @@ def main():
 
     # Step 3: Fetch new data for all timeframes
     # past 2 days
-    start_date = (datetime.now() - pd.DateOffset(years=10)).strftime("%Y-%m-%d")
+    start_date = (datetime.now() - pd.DateOffset(days=2)).strftime("%Y-%m-%d")
     end_date = datetime.now().strftime("%Y-%m-%d")
     timeframes = {
         # "1M": Client.KLINE_INTERVAL_1MONTH,
