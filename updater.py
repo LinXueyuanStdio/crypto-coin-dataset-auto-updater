@@ -11,6 +11,7 @@ from xlin import cp, rm, element_mapping
 from functools import partial
 import re
 import multiprocessing
+import traceback
 
 # Load environment variables
 load_dotenv()
@@ -190,6 +191,8 @@ def main():
     os.makedirs(NEW_DATA_FOLDER, exist_ok=True)
     os.makedirs(MERGED_FOLDER, exist_ok=True)
 
+    print("Starting dataset update process...")
+
     # Step 1: Clean folders (do not remove metadata until after successful upload)
     # clean_folder(DATA_FOLDER)
     # clean_folder(NEW_DATA_FOLDER)
@@ -285,9 +288,11 @@ def main():
             return False, None
         return True, new_file
 
+    print("Fetching new data from Binance...")
     element_mapping(jobs, f, thread_pool_size=multiprocessing.cpu_count())
 
     # Step 4: Merge new data with old datasets and save the merged files in MERGED_FOLDER
+    print("Merging datasets...")
     for pair in available_pairs:
         for tf_name, _ in timeframes.items():
             old_file = os.path.join(DATA_FOLDER, f"{pair}_{tf_name}.csv")
@@ -298,6 +303,7 @@ def main():
                 continue
             merge_datasets(old_file, new_file, merged_file)
 
+    print(f"Copying merged files to {DATA_FOLDER}...")
     for pair in available_pairs:
         for tf_name, _ in timeframes.items():
             merged_file = os.path.join(MERGED_FOLDER, f"{pair}_{tf_name}.csv")
@@ -312,6 +318,7 @@ def main():
     with open("data/README.md", "w") as file:
         file.write(readme)
 
+    print("Uploading updated datasets...")
     # Step 5: Upload updated datasets from MERGED_FOLDER with a retry loop until successful
     current_date = datetime.now().strftime("%B, %d %Y, %H:%M:%S")
     upload_successful = False
@@ -339,6 +346,7 @@ if __name__ == "__main__":
             break  # Exit loop if main() succeeds
         except Exception as e:
             attempt += 1
+            traceback.print_exc()
             print(f"Global attempt {attempt}/{max_attempts} failed: {e}")
             print("Retrying in 60 seconds...")
             time.sleep(60)
