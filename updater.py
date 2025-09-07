@@ -12,6 +12,7 @@ from functools import partial
 import re
 import multiprocessing
 import traceback
+import warnings
 
 # Load environment variables
 load_dotenv()
@@ -147,14 +148,53 @@ def fetch_binance_data(
 
 def merge_datasets(existing_file, new_file, output_file):
     """Merge existing and new datasets."""
+    def _safe_parse(dt_series):
+        """Safely parse a datetime series that may contain mixed formats (date-only & full timestamps)."""
+        if pd.api.types.is_datetime64_any_dtype(dt_series):
+            return dt_series
+        # First attempt: mixed (pandas >=2.0)
+        try:
+            parsed = pd.to_datetime(dt_series, format="mixed", errors="coerce")
+        except TypeError:
+            # Older pandas without format='mixed'
+            parsed = pd.to_datetime(dt_series, errors="coerce", infer_datetime_format=True)
+        # Fallback for any remaining NaT: try common explicit formats
+        if parsed.isna().any():
+            remaining = dt_series[parsed.isna()]
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y/%m/%d %H:%M:%S", "%Y/%m/%d"):
+                try:
+                    trial = pd.to_datetime(remaining, format=fmt, errors="coerce")
+                    parsed.loc[trial.notna()] = trial.dropna()
+                except Exception:
+                    pass
+        # If still NaT values exist, warn & drop later
+        if parsed.isna().any():
+            sample = dt_series[parsed.isna()].head(5).tolist()
+            warnings.warn(
+                f"Some 'Open time' values could not be parsed ({len(parsed.isna())} NaT). Sample: {sample}"
+            )
+        return parsed
+
     new_data = pd.read_csv(new_file)
-    new_data["Open time"] = pd.to_datetime(new_data["Open time"])
+    if "Open time" not in new_data.columns:
+        raise ValueError(f"Missing 'Open time' column in new file: {new_file}")
+    new_data["Open time"] = _safe_parse(new_data["Open time"])
     if os.path.exists(existing_file):
         existing_data = pd.read_csv(existing_file)
-        existing_data["Open time"] = pd.to_datetime(existing_data["Open time"])
-        merged_data = pd.concat([existing_data, new_data])
+        if "Open time" not in existing_data.columns:
+            warnings.warn(f"Existing file missing 'Open time' column, using only new data: {existing_file}")
+            merged_data = new_data
+        else:
+            existing_data["Open time"] = _safe_parse(existing_data["Open time"])
+            merged_data = pd.concat([existing_data, new_data])
     else:
         merged_data = new_data
+    # Drop rows with unparsable times
+    before = len(merged_data)
+    merged_data = merged_data.dropna(subset=["Open time"])  # remove rows where datetime failed
+    after = len(merged_data)
+    if after < before:
+        print(f"Dropped {before - after} rows with invalid 'Open time' in merge of {existing_file} + {new_file}")
     merged_data.drop_duplicates(subset="Open time", inplace=True)
     merged_data.sort_values(by="Open time", inplace=True)
     merged_data.to_csv(output_file, index=False)
