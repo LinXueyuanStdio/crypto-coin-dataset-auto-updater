@@ -10,6 +10,11 @@ on:
 jobs:
   update-dataset:
     runs-on: ubuntu-latest
+    # GitHub Actions defaults to a 360-minute (6h) job timeout, after which the
+    # job is silently cancelled. Set an explicit timeout so that a stuck run
+    # (e.g. Binance API blocked via the proxy) fails clearly and quickly
+    # instead of running for hours with no useful signal.
+    timeout-minutes: 120
 
     steps:
       - name: Check out repository
@@ -57,9 +62,19 @@ jobs:
           BINANCE_API_SECRET: ${{ secrets.BINANCE_API_SECRET }}
           HTTP_PROXY: "http://127.0.0.1:8118"
           HTTPS_PROXY: "http://127.0.0.1:8118"
+          # Ensure Python logs are flushed immediately instead of being
+          # buffered, so timestamps in the Actions log reflect reality.
+          PYTHONUNBUFFERED: "1"
         run: |
+          max_retries=5
+          retry=0
           until poetry run python updater.py; do
-            echo "Dataset update failed, retrying in 30 seconds..."
+            retry=$((retry + 1))
+            if [ "$retry" -ge "$max_retries" ]; then
+              echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] updater.py failed $retry times, giving up."
+              exit 1
+            fi
+            echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Dataset update failed (attempt $retry/$max_retries), retrying in 30 seconds..."
             sleep 30
           done
 

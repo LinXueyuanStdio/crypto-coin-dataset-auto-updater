@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import shutil
+import logging
 import pandas as pd
 from datetime import datetime
 from binance.client import Client
@@ -16,6 +17,18 @@ import warnings
 
 # Load environment variables
 load_dotenv()
+
+# Configure logging so every attempt/retry is timestamped and immediately
+# flushed to stdout. This makes it much easier to see, from the GitHub
+# Actions logs, how long each retry took and why the job might be stuck
+# looping (e.g. persistent proxy/Binance failures) instead of just seeing a
+# wall of un-timestamped "retrying..." messages.
+_stdout_handler = logging.StreamHandler(sys.stdout)
+_stdout_handler.setFormatter(
+    logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+)
+logging.basicConfig(level=logging.INFO, handlers=[_stdout_handler], force=True)
+logger = logging.getLogger("updater")
 
 HF_TOKEN = os.getenv("HF_TOKEN")
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
@@ -36,6 +49,7 @@ def create_binance_client(max_retries=3):
     }
 
     for attempt in range(max_retries):
+        start = time.monotonic()
         try:
             client = Client(
                 BINANCE_API_KEY,
@@ -48,12 +62,15 @@ def create_binance_client(max_retries=3):
             )
             # Test the connection
             client.ping()
-            print("Successfully connected to Binance API")
+            logger.info("Successfully connected to Binance API (took %.1fs)", time.monotonic() - start)
             return client
         except Exception as e:
-            print(f"Attempt {attempt + 1}/{max_retries} failed: {str(e)}")
+            logger.warning(
+                "create_binance_client attempt %d/%d failed after %.1fs: %s",
+                attempt + 1, max_retries, time.monotonic() - start, e,
+            )
             if attempt < max_retries - 1:
-                print("Waiting 10 seconds before retry...")
+                logger.info("Waiting 10 seconds before retry...")
                 time.sleep(10)
                 os.system("sudo service tor restart")
                 time.sleep(5)
@@ -77,7 +94,7 @@ def clean_folder(folder_path):
         file_path = os.path.join(folder_path, file)
         if os.path.isfile(file_path):
             os.remove(file_path)
-    print(f"Cleaned folder: {folder_path}")
+    logger.info("Cleaned folder: %s", folder_path)
 
 
 def download_dataset(dataset_slug, output_dir):
@@ -92,7 +109,7 @@ def download_dataset(dataset_slug, output_dir):
         cache_dir=output_dir,
         force_download=True,
     )
-    print(f"Dataset downloaded to {output_dir}")
+    logger.info("Dataset downloaded to %s", output_dir)
 
 
 def fetch_binance_data(
@@ -105,6 +122,7 @@ def fetch_binance_data(
 ):
     """Fetch historical data from Binance with retry logic."""
     for attempt in range(max_retries):
+        start = time.monotonic()
         try:
             client = create_binance_client()
             klines = client.get_historical_klines(
@@ -131,12 +149,15 @@ def fetch_binance_data(
             df["Open time"] = pd.to_datetime(df["Open time"], unit="ms")
             df["Close time"] = pd.to_datetime(df["Close time"], unit="ms")
             df.to_csv(output_file, index=False)
-            print(f"Fetched data saved to {output_file}")
+            logger.info("Fetched data saved to %s (took %.1fs)", output_file, time.monotonic() - start)
             return
         except Exception as e:
-            print(f"Attempt {attempt + 1}/{max_retries} failed: {str(e)}")
+            logger.warning(
+                "fetch_binance_data(%s, %s) attempt %d/%d failed after %.1fs: %s",
+                symbol, interval, attempt + 1, max_retries, time.monotonic() - start, e,
+            )
             if attempt < max_retries - 1:
-                print("Waiting 20 seconds before retry...")
+                logger.info("Waiting 20 seconds before retry...")
                 time.sleep(20)
                 os.system("sudo service tor restart")
                 time.sleep(5)
@@ -194,11 +215,11 @@ def merge_datasets(existing_file, new_file, output_file):
     merged_data = merged_data.dropna(subset=["Open time"])  # remove rows where datetime failed
     after = len(merged_data)
     if after < before:
-        print(f"Dropped {before - after} rows with invalid 'Open time' in merge of {existing_file} + {new_file}")
+        logger.warning("Dropped %d rows with invalid 'Open time' in merge of %s + %s", before - after, existing_file, new_file)
     merged_data.drop_duplicates(subset="Open time", inplace=True)
     merged_data.sort_values(by="Open time", inplace=True)
     merged_data.to_csv(output_file, index=False)
-    print(f"Merged dataset (from {merged_data['Open time'].min()} to {merged_data['Open time'].max()}) saved to {output_file}")
+    logger.info("Merged dataset (from %s to %s) saved to %s", merged_data['Open time'].min(), merged_data['Open time'].max(), output_file)
 
 
 def upload(upload_folder, dataset_slug, version_notes):
@@ -216,7 +237,7 @@ def upload(upload_folder, dataset_slug, version_notes):
             create_pr=False,
             commit_description=version_notes,
         )
-        print("Dataset updated.")
+        logger.info("Dataset updated.")
     finally:
         # Restore proxy settings after upload
         if original_http_proxy:
@@ -231,7 +252,7 @@ def main():
     os.makedirs(NEW_DATA_FOLDER, exist_ok=True)
     os.makedirs(MERGED_FOLDER, exist_ok=True)
 
-    print("Starting dataset update process...")
+    logger.info("Starting dataset update process...")
 
     # Step 1: Clean folders (do not remove metadata until after successful upload)
     # clean_folder(DATA_FOLDER)
@@ -319,31 +340,31 @@ def main():
         pair, tf_name, tf_interval = row
         new_file = os.path.join(NEW_DATA_FOLDER, f"{pair}_{tf_name}.csv")
         if os.path.exists(new_file):
-            print(f"File {new_file} already exists. Skipping...")
+            logger.info("File %s already exists. Skipping...", new_file)
             return True, new_file
-        print(f"Fetching data for {pair} at interval {tf_name} from {start_date} to {end_date}")
+        logger.info("Fetching data for %s at interval %s from %s to %s", pair, tf_name, start_date, end_date)
         fetch_binance_data(pair, tf_interval, start_date, end_date, new_file)
         if pd.read_csv(new_file).empty:
-            print(f"Warning: {new_file} is empty after fetching data.")
+            logger.warning("%s is empty after fetching data.", new_file)
             return False, None
         return True, new_file
 
-    print("Fetching new data from Binance...")
+    logger.info("Fetching new data from Binance...")
     element_mapping(jobs, f, thread_pool_size=multiprocessing.cpu_count())
 
     # Step 4: Merge new data with old datasets and save the merged files in MERGED_FOLDER
-    print("Merging datasets...")
+    logger.info("Merging datasets...")
     for pair in available_pairs:
         for tf_name, _ in timeframes.items():
             old_file = os.path.join(DATA_FOLDER, f"{pair}_{tf_name}.csv")
             new_file = os.path.join(NEW_DATA_FOLDER, f"{pair}_{tf_name}.csv")
             merged_file = os.path.join(MERGED_FOLDER, f"{pair}_{tf_name}.csv")
             if os.path.exists(merged_file):
-                print(f"Merged file {merged_file} already exists. Skipping...")
+                logger.info("Merged file %s already exists. Skipping...", merged_file)
                 continue
             merge_datasets(old_file, new_file, merged_file)
 
-    print(f"Copying merged files to {DATA_FOLDER}...")
+    logger.info("Copying merged files to %s...", DATA_FOLDER)
     for pair in available_pairs:
         for tf_name, _ in timeframes.items():
             merged_file = os.path.join(MERGED_FOLDER, f"{pair}_{tf_name}.csv")
@@ -358,38 +379,55 @@ def main():
     with open("data/README.md", "w") as file:
         file.write(readme)
 
-    print("Uploading updated datasets...")
+    logger.info("Uploading updated datasets...")
     # Step 5: Upload updated datasets from MERGED_FOLDER with a retry loop until successful
     current_date = datetime.now().strftime("%B, %d %Y, %H:%M:%S")
     upload_successful = False
-    while not upload_successful:
+    upload_attempt = 0
+    max_upload_attempts = 10
+    while not upload_successful and upload_attempt < max_upload_attempts:
+        upload_attempt += 1
+        start = time.monotonic()
         try:
             upload(DATA_FOLDER, dataset_slug, f"Updated at {current_date}")
             upload_successful = True
         except Exception as e:
-            print(f"Upload failed: {e}. Retrying in 60 seconds...")
+            logger.error(
+                "Upload attempt %d/%d failed after %.1fs: %s. Retrying in 60 seconds...",
+                upload_attempt, max_upload_attempts, time.monotonic() - start, e,
+            )
             time.sleep(60)
+    if not upload_successful:
+        raise RuntimeError(f"Upload failed after {max_upload_attempts} attempts")
 
     # Step 6: Once upload is successful, clean all folders
     # rm(DATA_FOLDER, debug=True)
     # rm(NEW_DATA_FOLDER, debug=True)
     # rm(MERGED_FOLDER, debug=True)
-    print("All folders cleaned.")
+    logger.info("All folders cleaned.")
 
 
 if __name__ == "__main__":
     max_attempts = 10  # Maximum number of global attempts
     attempt = 0
+    run_start = time.monotonic()
+    logger.info("Updater started. Global max attempts: %d", max_attempts)
     while attempt < max_attempts:
+        attempt_start = time.monotonic()
         try:
             main()
+            logger.info("Updater finished successfully in %.1fs (total elapsed %.1fs)",
+                        time.monotonic() - attempt_start, time.monotonic() - run_start)
             break  # Exit loop if main() succeeds
         except Exception as e:
             attempt += 1
             traceback.print_exc()
-            print(f"Global attempt {attempt}/{max_attempts} failed: {e}")
-            print("Retrying in 60 seconds...")
+            logger.error(
+                "Global attempt %d/%d failed after %.1fs (total elapsed %.1fs): %s",
+                attempt, max_attempts, time.monotonic() - attempt_start, time.monotonic() - run_start, e,
+            )
+            logger.info("Retrying in 60 seconds...")
             time.sleep(60)
     else:
-        print("Max attempts reached. Exiting.")
+        logger.error("Max attempts reached after %.1fs total. Exiting.", time.monotonic() - run_start)
         sys.exit(1)
