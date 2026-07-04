@@ -62,3 +62,28 @@ jobs:
             echo "Dataset update failed, retrying in 30 seconds..."
             sleep 30
           done
+
+      - name: Squash dataset repository history to a single commit
+        working-directory: data
+        run: |
+          set -e
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+
+          # Make sure we have the latest commit that was just pushed by the update script
+          BRANCH=$(git rev-parse --abbrev-ref HEAD)
+          git fetch origin "$BRANCH"
+          git reset --hard "origin/$BRANCH"
+          BEFORE_SHA=$(git rev-parse HEAD)
+
+          # Recreate the branch with a single commit containing the current state
+          git checkout --orphan squash-tmp
+          git add -A
+          git commit -m "Squash history to reduce repository size (was ${BEFORE_SHA}, $(date -u +%Y-%m-%dT%H:%M:%SZ))"
+          git branch -D "$BRANCH"
+          git branch -m "$BRANCH"
+
+          # Force-push the squashed history, discarding all previous commits.
+          # --force-with-lease guards against overwriting commits pushed by
+          # another process after our fetch above.
+          git push origin "$BRANCH" --force-with-lease="$BRANCH:$BEFORE_SHA"
