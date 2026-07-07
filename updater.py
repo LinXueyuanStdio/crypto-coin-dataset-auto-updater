@@ -64,8 +64,16 @@ def create_binance_client(max_retries=3):
             )
             # Use Binance's public market-data mirror to avoid geo-restriction
             # blocks on the regular API host when running from GitHub Actions.
+            # `client.API_URL` is set as a plain instance attribute during
+            # `Client.__init__` (see python-binance's BaseClient), so
+            # overriding it here is the supported way to repoint the client
+            # at an alternate host; there is no constructor option for a
+            # fully custom base URL.
             client.API_URL = BINANCE_PUBLIC_DATA_API_URL
-            # Test the connection
+            # `ping()` is Binance's public, unauthenticated connectivity
+            # check (same call the constructor would have made); it doesn't
+            # validate API key/secret, matching the previous behavior before
+            # this change.
             client.ping()
             logger.info("Successfully connected to Binance API (took %.1fs)", time.monotonic() - start)
             return client
