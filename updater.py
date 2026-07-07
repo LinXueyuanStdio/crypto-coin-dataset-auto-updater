@@ -34,20 +34,19 @@ HF_TOKEN = os.getenv("HF_TOKEN")
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 
-# Configure proxy settings (will be used for Binance API calls)
-proxies = {
-    "http": os.getenv("HTTP_PROXY"),
-    "https": os.getenv("HTTPS_PROXY"),
-}
+# GitHub Actions runners are hosted in datacenters (e.g. Azure US) whose IPs
+# are flagged by Binance's compliance geo-fencing, causing api.binance.com to
+# reject requests with a "restricted location" (451) error. Binance publishes
+# a separate public market-data mirror that serves the same public endpoints
+# (klines, ping, etc.) used by this script without that geo-restriction, so we
+# point the client at it instead of relying on a proxy (e.g. Tor exit nodes
+# are themselves blocked by Binance/CloudFront, which made the previous proxy
+# based workaround unreliable).
+BINANCE_PUBLIC_DATA_API_URL = "https://data-api.binance.vision/api"
 
 
 def create_binance_client(max_retries=3):
     """Create Binance client with retry logic."""
-    local_proxies = {
-        "http": os.getenv("HTTP_PROXY"),
-        "https": os.getenv("HTTPS_PROXY"),
-    }
-
     for attempt in range(max_retries):
         start = time.monotonic()
         try:
@@ -55,12 +54,26 @@ def create_binance_client(max_retries=3):
                 BINANCE_API_KEY,
                 BINANCE_API_SECRET,
                 {
-                    "proxies": local_proxies,
                     "timeout": 30,
                     "verify": True,
                 },
+                # Skip the constructor's built-in ping, since it targets the
+                # default api.binance.com host (which we override below)
+                # before we get a chance to point it at the public mirror.
+                ping=False,
             )
-            # Test the connection
+            # Use Binance's public market-data mirror to avoid geo-restriction
+            # blocks on the regular API host when running from GitHub Actions.
+            # `client.API_URL` is set as a plain instance attribute during
+            # `Client.__init__` (see python-binance's BaseClient), so
+            # overriding it here is the supported way to repoint the client
+            # at an alternate host; there is no constructor option for a
+            # fully custom base URL.
+            client.API_URL = BINANCE_PUBLIC_DATA_API_URL
+            # `ping()` is Binance's public, unauthenticated connectivity
+            # check (same call the constructor would have made); it doesn't
+            # validate API key/secret, matching the previous behavior before
+            # this change.
             client.ping()
             logger.info("Successfully connected to Binance API (took %.1fs)", time.monotonic() - start)
             return client
@@ -72,8 +85,6 @@ def create_binance_client(max_retries=3):
             if attempt < max_retries - 1:
                 logger.info("Waiting 10 seconds before retry...")
                 time.sleep(10)
-                os.system("sudo service tor restart")
-                time.sleep(5)
             else:
                 raise
 
@@ -159,8 +170,6 @@ def fetch_binance_data(
             if attempt < max_retries - 1:
                 logger.info("Waiting 20 seconds before retry...")
                 time.sleep(20)
-                os.system("sudo service tor restart")
-                time.sleep(5)
             else:
                 raise Exception(
                     f"Failed to fetch data for {symbol} at interval {interval} after {max_retries} attempts"
