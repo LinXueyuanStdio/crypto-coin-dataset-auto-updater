@@ -356,3 +356,56 @@ def test_run_update_zero_budget_skips_all(fut, tmp_path, monkeypatch):
     monkeypatch.setattr(fut, "process_job", lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not run")))
     n = fut.run_update(str(tmp_path), end_date=_dt.date(2026, 7, 8), budget=fut.Budget(0), max_workers=2)
     assert n == 0
+
+
+def test_fetch_series_daily_fallback_when_monthly_missing(fut):
+    import pandas as pd
+    kl = _by_name(fut, "klines")
+
+    def dl(url, columns):
+        if "/monthly/" in url:
+            return None  # monthly not published -> must fall back to daily
+        day = "-".join(url.split("-")[-3:]).replace(".zip", "")
+        ts = int(pd.Timestamp(day, tz="UTC").timestamp() * 1000)
+        return pd.DataFrame([[str(ts)] + ["1"] * 11], columns=list(kl.columns))
+
+    # gap June 28 -> Aug 3: monthly [(2026,6),(2026,7)] both "missing" -> daily fallback
+    df = fut.fetch_series(kl, "BTCUSDT", "1d", _dt.datetime(2026, 6, 28), _dt.date(2026, 8, 3), downloader=dl)
+    assert df is not None
+    days_present = set(df["open_time"].dt.date)
+    assert _dt.date(2026, 7, 15) in days_present   # mid-missing-month recovered via daily
+    assert _dt.date(2026, 7, 31) in days_present
+    assert _dt.date(2026, 6, 30) in days_present
+
+
+def test_fetch_series_funding_no_daily_fallback(fut):
+    fr = _by_name(fut, "fundingRate")
+    calls = {"daily": 0}
+
+    def dl(url, columns):
+        if "/daily/" in url:
+            calls["daily"] += 1
+        return None
+
+    df = fut.fetch_series(fr, "BTCUSDT", None, _dt.datetime(2026, 6, 15), _dt.date(2026, 7, 8), downloader=dl)
+    assert df is None
+    assert calls["daily"] == 0  # funding has no daily dump -> never falls back
+
+
+def test_process_job_preserves_value_text_across_merge(fut, tmp_path, monkeypatch):
+    import pandas as pd
+    kl = _by_name(fut, "klines")
+
+    def fetch1(dt, symbol, interval, last_dt, end_date, downloader=None):
+        return pd.DataFrame({"open_time": pd.to_datetime(["2026-07-01"]), "open": ["1.50000000"], "volume": ["10"]})
+
+    monkeypatch.setattr(fut, "fetch_series", fetch1)
+    p = fut.process_job(kl, "BTCUSDT", "1d", str(tmp_path), _dt.date(2026, 7, 1))
+
+    def fetch2(dt, symbol, interval, last_dt, end_date, downloader=None):
+        return pd.DataFrame({"open_time": pd.to_datetime(["2026-07-02"]), "open": ["2.00000000"], "volume": ["20"]})
+
+    monkeypatch.setattr(fut, "fetch_series", fetch2)
+    fut.process_job(kl, "BTCUSDT", "1d", str(tmp_path), _dt.date(2026, 7, 2))
+    text = open(p, encoding="utf-8").read()
+    assert "1.50000000" in text   # original text survives re-read + merge (not reformatted to 1.5)

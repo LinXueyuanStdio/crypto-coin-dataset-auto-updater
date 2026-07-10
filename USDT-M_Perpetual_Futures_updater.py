@@ -5,7 +5,7 @@ import sys
 import time
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import requests
 import pandas as pd
@@ -117,8 +117,19 @@ def _month_of(d):
     return (d.year, d.month)
 
 
+def _days_in_month(ym, end_date):
+    y, m = ym
+    first = date(y, m, 1)
+    ny, nm = next_month(y, m)
+    last = date(ny, nm, 1) - timedelta(days=1)
+    out, d = [], first
+    while d <= last and d <= end_date:
+        out.append(d)
+        d += timedelta(days=1)
+    return out
+
+
 def enumerate_periods(dt, last_dt, end_date):
-    from datetime import date
     if last_dt is None:
         fy, fm = parse_ym(dt.floor)
         start = date(fy, fm, 1)
@@ -179,12 +190,18 @@ def download_series_file(url, columns, max_retries=3, timeout=30):
 
 def fetch_series(dt, symbol, interval, last_dt, end_date, downloader=download_series_file):
     months, days = enumerate_periods(dt, last_dt, end_date)
+    day_set = set(days)
     frames = []
     for period in months:
         frame = downloader(file_url(dt, symbol, interval, "monthly", period), list(dt.columns))
         if frame is not None and len(frame):
             frames.append(frame)
-    for day in days:
+        elif dt.has_daily:
+            # Monthly bulk for this month is unavailable (e.g. a recently-ended
+            # month whose monthly zip is not published yet). Fall back to that
+            # month's daily dumps so the month is never silently skipped.
+            day_set.update(_days_in_month(period, end_date))
+    for day in sorted(day_set):
         frame = downloader(file_url(dt, symbol, interval, "daily", day), list(dt.columns))
         if frame is not None and len(frame):
             frames.append(frame)
@@ -221,8 +238,8 @@ def merge_frames(existing_df, new_df, time_col):
 
 
 def merge_datasets(existing_file, new_file, output_file, time_col):
-    new_df = pd.read_csv(new_file)
-    existing_df = pd.read_csv(existing_file) if os.path.exists(existing_file) else None
+    new_df = pd.read_csv(new_file, dtype=str)
+    existing_df = pd.read_csv(existing_file, dtype=str) if os.path.exists(existing_file) else None
     merged = merge_frames(existing_df, new_df, time_col)
     merged.to_csv(output_file, index=False)
     return merged
@@ -265,7 +282,7 @@ def process_job(dt, symbol, interval, data_folder, end_date, downloader=download
     new_df = fetch_series(dt, symbol, interval, last_dt, end_date, downloader=downloader)
     if new_df is None or new_df.empty:
         return None
-    existing_df = pd.read_csv(data_path) if os.path.exists(data_path) else None
+    existing_df = pd.read_csv(data_path, dtype=str) if os.path.exists(data_path) else None
     merged = merge_frames(existing_df, new_df, dt.time_col)
     merged.to_csv(data_path, index=False)
     return data_path
