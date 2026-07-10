@@ -159,3 +159,19 @@ def normalize_times(df, dt):
     if dt.time_col not in dt.ms_time_cols:
         df[dt.time_col] = pd.to_datetime(df[dt.time_col], errors="coerce")
     return df
+
+
+def download_series_file(url, columns, max_retries=3, timeout=30):
+    for attempt in range(max_retries):
+        try:
+            resp = requests.get(url, timeout=timeout)
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            return read_zip_csv(resp.content, columns)
+        except requests.RequestException:
+            if attempt < max_retries - 1:
+                time.sleep(5)
+            else:
+                raise
+    return None
