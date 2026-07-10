@@ -111,3 +111,35 @@ def file_url(dt, symbol, interval, freq, period):
         return f"{base}/{symbol}-{interval}-{stamp}.zip"
     base = f"{BASE_URL}/{freq}/{dt.path_segment}/{symbol}"
     return f"{base}/{symbol}-{dt.path_segment}-{stamp}.zip"
+
+
+def _month_of(d):
+    return (d.year, d.month)
+
+
+def enumerate_periods(dt, last_dt, end_date):
+    from datetime import date
+    if last_dt is None:
+        fy, fm = parse_ym(dt.floor)
+        start = date(fy, fm, 1)
+    else:
+        start = last_dt.date()
+    if start > end_date:
+        return [], []
+
+    months, days = [], []
+    if dt.has_monthly and dt.has_daily:
+        months = months_range(_month_of(start), _month_of(end_date))
+        first_of_end = date(end_date.year, end_date.month, 1)
+        d = max(start, first_of_end)
+        while d <= end_date:
+            days.append(d)
+            d += timedelta(days=1)
+    elif dt.has_monthly and not dt.has_daily:
+        months = months_range(_month_of(start), next_month(*_month_of(end_date)))
+    else:  # daily only
+        d = start
+        while d <= end_date:
+            days.append(d)
+            d += timedelta(days=1)
+    return months, days

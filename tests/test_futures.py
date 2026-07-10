@@ -75,3 +75,51 @@ def test_file_url_metrics_and_funding(fut):
     assert fut.file_url(fr, "BTCUSDT", None, "monthly", (2026, 6)) == (
         "https://data.binance.vision/data/futures/um/monthly/fundingRate/BTCUSDT/BTCUSDT-fundingRate-2026-06.zip"
     )
+
+
+def _by_name(fut, name):
+    return next(dt for dt in fut.DATA_TYPES if dt.name == name)
+
+
+def test_enumerate_klines_backfill(fut):
+    kl = _by_name(fut, "klines")
+    months, days = fut.enumerate_periods(kl, None, _dt.date(2026, 7, 8))
+    assert months[0] == (2020, 1)
+    assert months[-1] == (2026, 6)          # complete months, June is last before July
+    assert days == [_dt.date(2026, 7, d) for d in range(1, 9)]
+
+
+def test_enumerate_klines_small_gap_same_month(fut):
+    kl = _by_name(fut, "klines")
+    last = _dt.datetime(2026, 7, 5, 12, 0)
+    months, days = fut.enumerate_periods(kl, last, _dt.date(2026, 7, 8))
+    assert months == []                      # start month == end month
+    assert days == [_dt.date(2026, 7, d) for d in range(5, 9)]
+
+
+def test_enumerate_klines_multimonth_gap(fut):
+    kl = _by_name(fut, "klines")
+    last = _dt.datetime(2026, 5, 20, 0, 0)
+    months, days = fut.enumerate_periods(kl, last, _dt.date(2026, 7, 8))
+    assert months == [(2026, 5), (2026, 6)]  # May file covers 21–31, June full
+    assert days == [_dt.date(2026, 7, d) for d in range(1, 9)]
+
+
+def test_enumerate_metrics_daily_only(fut):
+    me = _by_name(fut, "metrics")
+    months, days = fut.enumerate_periods(me, _dt.datetime(2026, 7, 6), _dt.date(2026, 7, 8))
+    assert months == []
+    assert days == [_dt.date(2026, 7, 6), _dt.date(2026, 7, 7), _dt.date(2026, 7, 8)]
+
+
+def test_enumerate_funding_monthly_incl_current(fut):
+    fr = _by_name(fut, "fundingRate")
+    months, days = fut.enumerate_periods(fr, _dt.datetime(2026, 6, 15), _dt.date(2026, 7, 8))
+    assert months == [(2026, 6), (2026, 7)]
+    assert days == []
+
+
+def test_enumerate_nothing_when_up_to_date(fut):
+    kl = _by_name(fut, "klines")
+    months, days = fut.enumerate_periods(kl, _dt.datetime(2026, 7, 9), _dt.date(2026, 7, 8))
+    assert months == [] and days == []
