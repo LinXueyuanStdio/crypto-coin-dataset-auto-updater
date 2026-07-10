@@ -1,3 +1,6 @@
+import os
+
+
 def test_registry_has_six_enabled_types(fut):
     names = [dt.name for dt in fut.DATA_TYPES]
     assert names == ["klines", "markPrice", "indexPrice", "premiumIndex", "metrics", "fundingRate"]
@@ -320,3 +323,36 @@ def test_process_job_none_when_no_new_data(fut, tmp_path, monkeypatch):
     kl = _by_name(fut, "klines")
     monkeypatch.setattr(fut, "fetch_series", lambda *a, **k: None)
     assert fut.process_job(kl, "BTCUSDT", "1d", str(tmp_path), _dt.date(2026, 7, 3)) is None
+
+
+def test_ensure_and_stamp_readme(fut, tmp_path):
+    p = tmp_path / "README.md"
+    fut.ensure_readme(str(p))
+    assert p.exists()
+    body = p.read_text(encoding="utf-8")
+    assert "USDT-M" in body and "Last updated on" in body
+    fut.stamp_readme(str(p))
+    assert "Last updated on `" in p.read_text(encoding="utf-8")
+
+
+def test_run_update_respects_budget_and_counts(fut, tmp_path, monkeypatch):
+    kl = _by_name(fut, "klines")
+    monkeypatch.setattr(fut, "SYMBOLS", ["BTCUSDT"])
+    monkeypatch.setattr(fut, "DATA_TYPES", [kl])
+    monkeypatch.setattr(fut, "INTERVALS", ["1d", "1h"])
+
+    processed = []
+
+    def fake_process(dt, symbol, interval, data_folder, end_date, downloader=None):
+        processed.append(interval)
+        return os.path.join(data_folder, f"{symbol}_{interval}.csv")
+
+    monkeypatch.setattr(fut, "process_job", fake_process)
+    n = fut.run_update(str(tmp_path), end_date=_dt.date(2026, 7, 8), budget=fut.Budget(1000), max_workers=2)
+    assert n == 2 and set(processed) == {"1d", "1h"}
+
+
+def test_run_update_zero_budget_skips_all(fut, tmp_path, monkeypatch):
+    monkeypatch.setattr(fut, "process_job", lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not run")))
+    n = fut.run_update(str(tmp_path), end_date=_dt.date(2026, 7, 8), budget=fut.Budget(0), max_workers=2)
+    assert n == 0

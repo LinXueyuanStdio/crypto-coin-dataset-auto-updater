@@ -269,3 +269,155 @@ def process_job(dt, symbol, interval, data_folder, end_date, downloader=download
     merged = merge_frames(existing_df, new_df, dt.time_col)
     merged.to_csv(data_path, index=False)
     return data_path
+
+
+from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+README_TEMPLATE = """# USDT-M Perpetual Futures (Binance)
+
+Binance USDT-margined perpetual futures data, auto-updated from the public
+`data.binance.vision` bulk data mirror.
+
+币安 U 本位永续合约数据集，自动从 `data.binance.vision` 公共数据镜像更新。
+
+## Files / 文件
+
+- `{symbol}_{interval}.csv` — OHLCV klines (量价)
+- `{symbol}_markPrice_{interval}.csv` — mark price klines (标记价格)
+- `{symbol}_indexPrice_{interval}.csv` — index price klines (指数价格)
+- `{symbol}_premiumIndex_{interval}.csv` — premium index klines (溢价指数)
+- `{symbol}_metrics.csv` — open interest + long/short ratios + taker buy/sell ratio (持仓量与多空比)
+- `{symbol}_fundingRate.csv` — funding rate history (资金费率)
+
+```python
+from datasets import load_dataset
+dataset = load_dataset("linxy/USDT-M_Perpetual_Futures", data_files=["BTCUSDT_1d.csv"], split="train")
+```
+
+Last updated on `pending`
+"""
+
+
+def ensure_readme(path):
+    if not os.path.exists(path):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(README_TEMPLATE)
+
+
+def stamp_readme(path):
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            body = f.read()
+    else:
+        body = README_TEMPLATE
+    if "Last updated on `" in body:
+        body = re.sub(r"Last updated on `.*?`", f"Last updated on `{now}`", body)
+    else:
+        body += f"\n\nLast updated on `{now}`\n"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(body)
+
+
+def run_update(data_folder, end_date=None, budget=None, max_workers=None):
+    if end_date is None:
+        end_date = datetime.now(timezone.utc).date() - timedelta(days=1)
+    if budget is None:
+        budget = Budget(float(os.getenv("MAX_RUNTIME_MIN", "90")))
+    if max_workers is None:
+        max_workers = int(os.getenv("FETCH_WORKERS", "32"))
+
+    jobs = iter(build_jobs())
+    produced = 0
+    inflight = set()
+
+    def submit_next(ex):
+        try:
+            job = next(jobs)
+        except StopIteration:
+            return False
+        inflight.add(ex.submit(process_job, job.dt, job.symbol, job.interval, data_folder, end_date))
+        return True
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        for _ in range(max_workers):
+            if budget.exceeded() or not submit_next(ex):
+                break
+        while inflight:
+            done, pending = wait(inflight, return_when=FIRST_COMPLETED)
+            inflight = pending
+            for f in done:
+                try:
+                    if f.result() is not None:
+                        produced += 1
+                except Exception as e:
+                    logger.warning("series failed: %s", e)
+            if not budget.exceeded():
+                for _ in range(len(done)):
+                    if not submit_next(ex):
+                        break
+    logger.info("run_update produced data for %d series", produced)
+    return produced
+
+
+def upload(upload_folder, dataset_slug, version_notes):
+    api = HfApi(token=os.getenv("HF_TOKEN"))
+    api.upload_folder(
+        folder_path=upload_folder,
+        repo_id=dataset_slug,
+        repo_type="dataset",
+        commit_message=version_notes,
+        commit_description=version_notes,
+        create_pr=False,
+    )
+    logger.info("Dataset uploaded to %s", dataset_slug)
+
+
+def main():
+    dataset_slug = os.getenv("DATASET_SLUG", "linxy/USDT-M_Perpetual_Futures")
+    data_folder = os.path.join(BASE_DIR, os.getenv("DATA_DIR", "data"))
+    os.makedirs(data_folder, exist_ok=True)
+
+    logger.info("Starting USDT-M perpetual futures update -> %s", dataset_slug)
+    run_update(data_folder)
+
+    readme_path = os.path.join(data_folder, "README.md")
+    ensure_readme(readme_path)
+    stamp_readme(readme_path)
+
+    notes = datetime.now(timezone.utc).strftime("Updated at %B %d %Y %H:%M:%S UTC")
+    for attempt in range(1, 11):
+        try:
+            upload(data_folder, dataset_slug, notes)
+            break
+        except Exception as e:
+            logger.error("Upload attempt %d/10 failed: %s. Retrying in 60s...", attempt, e)
+            time.sleep(60)
+    else:
+        raise RuntimeError("Upload failed after 10 attempts")
+
+
+if __name__ == "__main__":
+    _handler = logging.StreamHandler(sys.stdout)
+    _handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    logging.basicConfig(level=logging.INFO, handlers=[_handler], force=True)
+
+    max_attempts = 10
+    attempt = 0
+    while attempt < max_attempts:
+        try:
+            main()
+            logger.info("Updater finished successfully.")
+            break
+        except Exception as e:
+            attempt += 1
+            import traceback
+            traceback.print_exc()
+            logger.error("Global attempt %d/%d failed: %s. Retrying in 60s...", attempt, max_attempts, e)
+            time.sleep(60)
+    else:
+        logger.error("Max attempts reached. Exiting.")
+        sys.exit(1)
