@@ -17,6 +17,9 @@ PySocks = "^1.7.1"
 Huggingface_hub = "*"
 xlin = "*"
 
+[tool.poetry.group.dev.dependencies]
+pytest = "*"
+
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
