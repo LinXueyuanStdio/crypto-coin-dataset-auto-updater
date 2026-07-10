@@ -302,8 +302,9 @@ def test_process_job_writes_then_resumes(fut, tmp_path, monkeypatch):
         })
 
     monkeypatch.setattr(fut, "fetch_series", fetch_first)
-    path = fut.process_job(kl, "BTCUSDT", "1d", str(tmp_path), _dt.date(2026, 7, 2))
+    path, new_last = fut.process_job(kl, "BTCUSDT", "1d", str(tmp_path), _dt.date(2026, 7, 2), None)
     assert path is not None and pd.read_csv(path).shape[0] == 2
+    assert new_last.day == 2
 
     # second run: last stored is 2026-07-02 -> fetch returns overlap + 1 new
     def fetch_second(dt, symbol, interval, last_dt, end_date, downloader=None):
@@ -314,15 +315,16 @@ def test_process_job_writes_then_resumes(fut, tmp_path, monkeypatch):
         })
 
     monkeypatch.setattr(fut, "fetch_series", fetch_second)
-    fut.process_job(kl, "BTCUSDT", "1d", str(tmp_path), _dt.date(2026, 7, 3))
+    _, new_last2 = fut.process_job(kl, "BTCUSDT", "1d", str(tmp_path), _dt.date(2026, 7, 3), _dt.datetime(2026, 7, 2))
     df = pd.read_csv(path)
     assert df.shape[0] == 3  # deduped 2026-07-02
+    assert new_last2.day == 3
 
 
 def test_process_job_none_when_no_new_data(fut, tmp_path, monkeypatch):
     kl = _by_name(fut, "klines")
     monkeypatch.setattr(fut, "fetch_series", lambda *a, **k: None)
-    assert fut.process_job(kl, "BTCUSDT", "1d", str(tmp_path), _dt.date(2026, 7, 3)) is None
+    assert fut.process_job(kl, "BTCUSDT", "1d", str(tmp_path), _dt.date(2026, 7, 3), None) is None
 
 
 def test_ensure_and_stamp_readme(fut, tmp_path):
@@ -343,9 +345,9 @@ def test_run_update_respects_budget_and_counts(fut, tmp_path, monkeypatch):
 
     processed = []
 
-    def fake_process(dt, symbol, interval, data_folder, end_date, downloader=None):
+    def fake_process(dt, symbol, interval, data_folder, end_date, last_dt, downloader=None):
         processed.append(interval)
-        return os.path.join(data_folder, f"{symbol}_{interval}.csv")
+        return os.path.join(data_folder, f"{symbol}_{interval}.csv"), _dt.datetime(2026, 7, 8)
 
     monkeypatch.setattr(fut, "process_job", fake_process)
     n = fut.run_update(str(tmp_path), end_date=_dt.date(2026, 7, 8), budget=fut.Budget(1000), max_workers=2)
@@ -400,12 +402,75 @@ def test_process_job_preserves_value_text_across_merge(fut, tmp_path, monkeypatc
         return pd.DataFrame({"open_time": pd.to_datetime(["2026-07-01"]), "open": ["1.50000000"], "volume": ["10"]})
 
     monkeypatch.setattr(fut, "fetch_series", fetch1)
-    p = fut.process_job(kl, "BTCUSDT", "1d", str(tmp_path), _dt.date(2026, 7, 1))
+    p, _ = fut.process_job(kl, "BTCUSDT", "1d", str(tmp_path), _dt.date(2026, 7, 1), None)
 
     def fetch2(dt, symbol, interval, last_dt, end_date, downloader=None):
         return pd.DataFrame({"open_time": pd.to_datetime(["2026-07-02"]), "open": ["2.00000000"], "volume": ["20"]})
 
     monkeypatch.setattr(fut, "fetch_series", fetch2)
-    fut.process_job(kl, "BTCUSDT", "1d", str(tmp_path), _dt.date(2026, 7, 2))
+    fut.process_job(kl, "BTCUSDT", "1d", str(tmp_path), _dt.date(2026, 7, 2), _dt.datetime(2026, 7, 1))
     text = open(p, encoding="utf-8").read()
     assert "1.50000000" in text   # original text survives re-read + merge (not reformatted to 1.5)
+
+
+def test_index_save_load_roundtrip(fut, tmp_path):
+    idx = {"BTCUSDT_1d.csv": "2026-07-09 00:00:00", "BTCUSDT_metrics.csv": "2026-07-09 23:55:00"}
+    fut.save_index(str(tmp_path), idx)
+    assert (tmp_path / "_index.json").exists()
+    assert fut.load_index(str(tmp_path)) == idx
+
+
+def test_load_index_missing_returns_empty(fut, tmp_path):
+    assert fut.load_index(str(tmp_path)) == {}
+
+
+def test_index_last_dt(fut):
+    idx = {"BTCUSDT_1d.csv": "2026-07-09 00:00:00"}
+    ts = fut.index_last_dt(idx, "BTCUSDT_1d.csv")
+    assert ts is not None and ts.year == 2026 and ts.month == 7 and ts.day == 9
+    assert fut.index_last_dt(idx, "MISSING.csv") is None
+
+
+def test_needs_update(fut):
+    end = _dt.date(2026, 7, 9)
+    assert fut.needs_update(None, end) is True                       # never fetched
+    assert fut.needs_update(_dt.datetime(2026, 7, 8), end) is True   # a day behind
+    assert fut.needs_update(_dt.datetime(2026, 7, 9, 12), end) is False  # already at end_date
+    assert fut.needs_update(_dt.datetime(2026, 7, 10), end) is False     # ahead
+
+
+def test_build_index_from_files(fut, tmp_path, monkeypatch):
+    kl = _by_name(fut, "klines")
+    monkeypatch.setattr(fut, "SYMBOLS", ["BTCUSDT"])
+    monkeypatch.setattr(fut, "DATA_TYPES", [kl])
+    monkeypatch.setattr(fut, "INTERVALS", ["1d"])
+    (tmp_path / "BTCUSDT_1d.csv").write_text("open_time,open\n2026-07-01 00:00:00,1\n2026-07-05 00:00:00,2\n")
+    idx = fut.build_index_from_files(str(tmp_path))
+    assert idx == {"BTCUSDT_1d.csv": "2026-07-05 00:00:00"}
+
+
+def test_run_update_skips_up_to_date_via_index(fut, tmp_path, monkeypatch):
+    kl = _by_name(fut, "klines")
+    monkeypatch.setattr(fut, "SYMBOLS", ["BTCUSDT"])
+    monkeypatch.setattr(fut, "DATA_TYPES", [kl])
+    monkeypatch.setattr(fut, "INTERVALS", ["1d"])
+    fut.save_index(str(tmp_path), {"BTCUSDT_1d.csv": "2026-07-08 00:00:00"})
+    monkeypatch.setattr(fut, "process_job",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not run for up-to-date file")))
+    n = fut.run_update(str(tmp_path), end_date=_dt.date(2026, 7, 8), budget=fut.Budget(1000), max_workers=2)
+    assert n == 0  # last_dt (07-08) == end_date -> skipped entirely
+
+
+def test_run_update_updates_index(fut, tmp_path, monkeypatch):
+    kl = _by_name(fut, "klines")
+    monkeypatch.setattr(fut, "SYMBOLS", ["BTCUSDT"])
+    monkeypatch.setattr(fut, "DATA_TYPES", [kl])
+    monkeypatch.setattr(fut, "INTERVALS", ["1d"])
+
+    def fake_process(dt, symbol, interval, data_folder, end_date, last_dt, downloader=None):
+        assert last_dt is None  # no index entry -> full backfill
+        return os.path.join(data_folder, "BTCUSDT_1d.csv"), _dt.datetime(2026, 7, 8, 0, 0, 0)
+
+    monkeypatch.setattr(fut, "process_job", fake_process)
+    fut.run_update(str(tmp_path), end_date=_dt.date(2026, 7, 8), budget=fut.Budget(1000), max_workers=2)
+    assert fut.load_index(str(tmp_path)).get("BTCUSDT_1d.csv") == "2026-07-08 00:00:00"

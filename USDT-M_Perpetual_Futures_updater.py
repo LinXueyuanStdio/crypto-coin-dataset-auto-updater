@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import re
 import sys
@@ -300,17 +301,68 @@ def build_jobs():
     return jobs
 
 
-def process_job(dt, symbol, interval, data_folder, end_date, downloader=download_series_file):
+# ----- progress index -----
+# `_index.json` (stored in the dataset, cloned with the data) maps each output
+# CSV to its last stored timestamp. It lets a run decide which files need
+# updating without reading every CSV, and skip files already current — no read,
+# no fetch, no rewrite, no re-upload.
+INDEX_FILENAME = "_index.json"
+
+
+def load_index(data_folder):
+    path = os.path.join(data_folder, INDEX_FILENAME)
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (ValueError, OSError):
+        return {}
+
+
+def save_index(data_folder, index):
+    path = os.path.join(data_folder, INDEX_FILENAME)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(index, f, indent=0, sort_keys=True)
+
+
+def index_last_dt(index, filename):
+    value = index.get(filename)
+    if not value:
+        return None
+    ts = pd.to_datetime(value, errors="coerce")
+    return None if pd.isna(ts) else ts.to_pydatetime()
+
+
+def needs_update(last_dt, end_date):
+    return last_dt is None or last_dt.date() < end_date
+
+
+def build_index_from_files(data_folder):
+    """One-time bootstrap: derive the index from CSVs already on disk."""
+    index = {}
+    for job in build_jobs():
+        filename = output_filename(job.dt, job.symbol, job.interval)
+        path = os.path.join(data_folder, filename)
+        if os.path.exists(path):
+            last = latest_stored_time(path, job.dt.time_col)
+            if last is not None:
+                index[filename] = last.strftime("%Y-%m-%d %H:%M:%S")
+    return index
+
+
+def process_job(dt, symbol, interval, data_folder, end_date, last_dt, downloader=download_series_file):
     out_name = output_filename(dt, symbol, interval)
     data_path = os.path.join(data_folder, out_name)
-    last_dt = latest_stored_time(data_path, dt.time_col)
     new_df = fetch_series(dt, symbol, interval, last_dt, end_date, downloader=downloader)
     if new_df is None or new_df.empty:
         return None
     existing_df = pd.read_csv(data_path, dtype=str) if os.path.exists(data_path) else None
     merged = merge_frames(existing_df, new_df, dt.time_col)
     merged.to_csv(data_path, index=False)
-    return data_path
+    new_last = pd.to_datetime(merged[dt.time_col], errors="coerce").max()
+    return data_path, (None if pd.isna(new_last) else new_last.to_pydatetime())
 
 
 from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
@@ -332,6 +384,7 @@ Binance USDT-margined perpetual futures data, auto-updated from the public
 - `{symbol}_premiumIndex_{interval}.csv` — premium index klines (溢价指数)
 - `{symbol}_metrics.csv` — open interest + long/short ratios + taker buy/sell ratio (持仓量与多空比)
 - `{symbol}_fundingRate.csv` — funding rate history (资金费率)
+- `_index.json` — updater bookkeeping (last timestamp per file; used to update only what changed)
 
 ```python
 from datasets import load_dataset
@@ -371,16 +424,32 @@ def run_update(data_folder, end_date=None, budget=None, max_workers=None):
     if max_workers is None:
         max_workers = int(os.getenv("FETCH_WORKERS", "8" if PROXY else "32"))
 
-    jobs = iter(build_jobs())
+    index = load_index(data_folder)
+    if not index:
+        index = build_index_from_files(data_folder)
+        if index:
+            logger.info("Bootstrapped index from %d existing files", len(index))
+
+    all_jobs = build_jobs()
+    pending = []
+    for job in all_jobs:
+        filename = output_filename(job.dt, job.symbol, job.interval)
+        last_dt = index_last_dt(index, filename)
+        if needs_update(last_dt, end_date):
+            pending.append((job, filename, last_dt))
+    logger.info("%d/%d series need update (end_date=%s)", len(pending), len(all_jobs), end_date)
+
+    jobs = iter(pending)
     produced = 0
-    inflight = set()
+    inflight = {}  # future -> output filename
 
     def submit_next(ex):
         try:
-            job = next(jobs)
+            job, filename, last_dt = next(jobs)
         except StopIteration:
             return False
-        inflight.add(ex.submit(process_job, job.dt, job.symbol, job.interval, data_folder, end_date))
+        fut = ex.submit(process_job, job.dt, job.symbol, job.interval, data_folder, end_date, last_dt)
+        inflight[fut] = filename
         return True
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -388,11 +457,15 @@ def run_update(data_folder, end_date=None, budget=None, max_workers=None):
             if budget.exceeded() or not submit_next(ex):
                 break
         while inflight:
-            done, pending = wait(inflight, return_when=FIRST_COMPLETED)
-            inflight = pending
+            done, _ = wait(set(inflight), return_when=FIRST_COMPLETED)
             for f in done:
+                filename = inflight.pop(f)
                 try:
-                    if f.result() is not None:
+                    result = f.result()
+                    if result is not None:
+                        _, new_last = result
+                        if new_last is not None:
+                            index[filename] = new_last.strftime("%Y-%m-%d %H:%M:%S")
                         produced += 1
                 except Exception as e:
                     logger.warning("series failed: %s", e)
@@ -400,7 +473,9 @@ def run_update(data_folder, end_date=None, budget=None, max_workers=None):
                 for _ in range(len(done)):
                     if not submit_next(ex):
                         break
-    logger.info("run_update produced data for %d series", produced)
+
+    save_index(data_folder, index)
+    logger.info("run_update produced data for %d series; index has %d entries", produced, len(index))
     return produced
 
 
