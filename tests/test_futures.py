@@ -380,6 +380,24 @@ def test_fetch_series_daily_fallback_when_monthly_missing(fut):
     assert _dt.date(2026, 6, 30) in days_present
 
 
+def test_fetch_series_no_daily_fallback_for_old_missing_months(fut):
+    kl = _by_name(fut, "klines")
+    daily_months = set()
+
+    def dl(url, columns):
+        if "/daily/" in url:
+            parts = url.split("-")
+            daily_months.add(parts[-3] + "-" + parts[-2])  # YYYY-MM of the daily file
+        return None  # everything missing (delisted-like)
+
+    # Delisted-like: last data 2022-11, end 2026-07-09. Old missing months must
+    # NOT trigger a daily sweep -- only recent months (<= FALLBACK_MONTHS) may.
+    fut.fetch_series(kl, "FTTUSDT", "1d", _dt.datetime(2022, 11, 8), _dt.date(2026, 7, 9), downloader=dl)
+    assert "2022-12" not in daily_months
+    assert "2024-01" not in daily_months
+    assert daily_months and all(m >= "2026-05" for m in daily_months), daily_months
+
+
 def test_fetch_series_funding_no_daily_fallback(fut):
     fr = _by_name(fut, "fundingRate")
     calls = {"daily": 0}

@@ -214,6 +214,17 @@ def download_series_file(url, columns, max_retries=3, timeout=30):
     return None
 
 
+# A missing monthly zip only triggers daily fallback when the month is recent
+# (its monthly bulk may simply not be published yet). For older months a 404
+# means the data genuinely does not exist (delisted / pre-listing), so falling
+# back would sweep ~30 non-existent daily files per month for years of history.
+FALLBACK_MONTHS = 2
+
+
+def _months_before_end(ym, end_date):
+    return (end_date.year - ym[0]) * 12 + (end_date.month - ym[1])
+
+
 def fetch_series(dt, symbol, interval, last_dt, end_date, downloader=download_series_file):
     months, days = enumerate_periods(dt, last_dt, end_date)
     day_set = set(days)
@@ -222,8 +233,8 @@ def fetch_series(dt, symbol, interval, last_dt, end_date, downloader=download_se
         frame = downloader(file_url(dt, symbol, interval, "monthly", period), list(dt.columns))
         if frame is not None and len(frame):
             frames.append(frame)
-        elif dt.has_daily:
-            # Monthly bulk for this month is unavailable (e.g. a recently-ended
+        elif dt.has_daily and 0 <= _months_before_end(period, end_date) <= FALLBACK_MONTHS:
+            # Monthly bulk for this recent month is unavailable (e.g. a just-ended
             # month whose monthly zip is not published yet). Fall back to that
             # month's daily dumps so the month is never silently skipped.
             day_set.update(_days_in_month(period, end_date))
