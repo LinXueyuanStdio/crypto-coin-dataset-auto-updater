@@ -241,3 +241,32 @@ def test_fetch_series_empty_range_returns_none(fut):
 
     df = fut.fetch_series(kl, "BTCUSDT", "1d", _dt.datetime(2026, 7, 9), _dt.date(2026, 7, 8), downloader=dl)
     assert df is None and called["n"] == 0
+
+
+def test_latest_stored_time_missing_file(fut, tmp_path):
+    assert fut.latest_stored_time(str(tmp_path / "nope.csv"), "open_time") is None
+
+
+def test_latest_stored_time_reads_max(fut, tmp_path):
+    p = tmp_path / "BTCUSDT_1d.csv"
+    p.write_text("open_time,open\n2026-07-01 00:00:00,1\n2026-07-03 00:00:00,2\n")
+    ts = fut.latest_stored_time(str(p), "open_time")
+    assert ts is not None and ts.year == 2026 and ts.month == 7 and ts.day == 3
+
+
+def test_merge_frames_dedups_and_sorts(fut):
+    import pandas as pd
+    existing = pd.DataFrame({"open_time": ["2026-07-01", "2026-07-02"], "close": ["a", "b"]})
+    new = pd.DataFrame({"open_time": pd.to_datetime(["2026-07-02", "2026-07-03"]), "close": ["B", "c"]})
+    merged = fut.merge_frames(existing, new, "open_time")
+    assert list(merged["open_time"].dt.day) == [1, 2, 3]           # sorted, deduped
+    assert len(merged) == 3
+
+
+def test_merge_datasets_no_existing(fut, tmp_path):
+    import pandas as pd
+    newf = tmp_path / "new.csv"
+    pd.DataFrame({"calc_time": ["2026-06-01 00:00:00"], "last_funding_rate": ["0.0001"]}).to_csv(newf, index=False)
+    out = tmp_path / "out.csv"
+    merged = fut.merge_datasets(str(tmp_path / "absent.csv"), str(newf), str(out), "calc_time")
+    assert len(merged) == 1 and out.exists()

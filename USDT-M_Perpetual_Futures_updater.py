@@ -191,3 +191,38 @@ def fetch_series(dt, symbol, interval, last_dt, end_date, downloader=download_se
     if not frames:
         return None
     return normalize_times(pd.concat(frames, ignore_index=True), dt)
+
+
+def latest_stored_time(path, time_col):
+    if not os.path.exists(path):
+        return None
+    try:
+        df = pd.read_csv(path, usecols=[time_col])
+    except (ValueError, pd.errors.EmptyDataError):
+        return None
+    if df.empty:
+        return None
+    ts = pd.to_datetime(df[time_col], errors="coerce").max()
+    return None if pd.isna(ts) else ts.to_pydatetime()
+
+
+def merge_frames(existing_df, new_df, time_col):
+    new_df = new_df.copy()
+    new_df[time_col] = pd.to_datetime(new_df[time_col], errors="coerce")
+    if existing_df is not None and len(existing_df):
+        existing_df = existing_df.copy()
+        existing_df[time_col] = pd.to_datetime(existing_df[time_col], errors="coerce")
+        merged = pd.concat([existing_df, new_df], ignore_index=True)
+    else:
+        merged = new_df
+    merged = merged.dropna(subset=[time_col])
+    merged = merged.drop_duplicates(subset=time_col).sort_values(time_col)
+    return merged.reset_index(drop=True)
+
+
+def merge_datasets(existing_file, new_file, output_file, time_col):
+    new_df = pd.read_csv(new_file)
+    existing_df = pd.read_csv(existing_file) if os.path.exists(existing_file) else None
+    merged = merge_frames(existing_df, new_df, time_col)
+    merged.to_csv(output_file, index=False)
+    return merged
