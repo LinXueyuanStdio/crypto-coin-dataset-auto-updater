@@ -6,7 +6,11 @@
 
 ## Goal
 
-Add a sibling to the existing spot updater that keeps a Hugging Face dataset of **Binance USDT-margined perpetual futures** data fresh on a daily schedule. Beyond OHLCV ("量价"), it must also pull funding rate, open interest, long/short ratios, taker buy/sell ratio, and mark/index/premium-index klines — i.e. everything Binance publishes for USDT-M perps.
+Add a sibling to the existing spot updater that keeps a Hugging Face dataset of **Binance USDT-margined perpetual futures** data fresh. Beyond OHLCV ("量价"), it must also pull funding rate, open interest, long/short ratios, taker buy/sell ratio, and mark/index/premium-index klines — i.e. everything Binance publishes for USDT-M perps.
+
+Two behaviors are required:
+- **Full historical backfill** — on first run (empty dataset) it pulls *all* available history for every series.
+- **Gap-aware incremental** — each subsequent run computes the gap between the latest timestamp already stored (per output file) and the latest data available on the CDN, then batch-fills everything in between. The window is **not** a fixed hardcoded range: because the daily job can fail or be skipped, a real gap may span several days (or, mid-backfill, months). The dataset itself is the source of truth for "where we left off."
 
 Deliverables (new files, copies/adaptations of the existing ones):
 - `USDT-M_Perpetual_Futures_updater.py` (repo root, sibling of `updater.py`)
@@ -23,7 +27,7 @@ The reliable source is the **`data.binance.vision` bulk data CDN** (Binance's pu
 
 - **No Binance API key needed** — the CDN is unauthenticated. The workflow only needs `HF_TOKEN`.
 - Data arrives as daily/monthly `.zip` files each containing exactly one `.csv`.
-- Trade-off: daily dumps lag by ~T+1 (a given day's file appears the next day). Acceptable for a daily-cron historical dataset; handled by a small lookback window.
+- Trade-off: daily dumps lag by ~T+1 (a given day's file appears the next day). Acceptable for a daily-cron historical dataset; the gap-aware enumeration (below) simply treats yesterday as the latest available day.
 
 ## Data types, source paths, and output files
 
@@ -74,24 +78,48 @@ Reused from `updater.py` (kept, lightly generalized):
 Replaced (the fetch layer):
 - Remove `binance.client.Client`, `create_binance_client`, `fetch_binance_data`, and all proxy/API-key handling.
 - Add `download_zip_csv(url) -> pd.DataFrame | None`: `requests.get` → on 200, `pd.read_csv(BytesIO(content), compression='zip')` with header detection; on 404 return `None`; retry on transient network errors.
-- Add per-type fetchers that build URLs, iterate the lookback window (daily) or month set (funding), concat the day/month frames, and write one `new_data/*.csv` per (symbol, type[, interval]).
+- Add `latest_stored_time(existing_file, time_col)` → reads the existing merged CSV and returns its max timestamp (or `None`).
+- Add per-type gap-aware fetchers: given `(symbol, type, interval, last_dt)`, enumerate the monthly+daily period URLs from `last_dt` (or the type floor) to yesterday, download+concat (skip 404), and write one `new_data/*.csv` per series.
+- Main loop builds the (symbol × type × interval) job list, honors the soft `MAX_RUNTIME_MIN` budget, then merges + uploads once.
 
 Parallelism: keep `xlin.element_mapping` with a thread pool over the (symbol × type × interval) job list, mirroring the spot updater.
 
-## Incremental window & robustness
+## Incremental & backfill (gap-aware, enumeration by walk-from-floor)
 
-- **Daily types** (klines, mark/index/premium, metrics): fetch dates `[today-N … today-1]`, default `N = 3` (covers T+1 lag + a couple of missed runs); merge dedups overlaps.
-- **Funding rate** (monthly): fetch current month + previous month zips (covers month boundaries); the current-month file is re-fetched every run to pick up new rows.
-- **Lookback is an env var** (e.g. `LOOKBACK_DAYS`) so a one-time full **backfill** run is trivial (set it large). First scheduled run against the dataset seeds only the lookback window; full history backfill is an explicit separate run, out of scope for the daily job.
-- **404 = skip**, not fail (delisted symbols, not-yet-published dates, intervals a variant lacks). Only genuine network/parse errors trigger retries.
-- Generate a `data/README.md` from a template if the dataset lacks one (documents file naming + `load_dataset` usage), then stamp "Last updated on".
+The fetch range is derived **per output file** from the data already stored — never a fixed window.
+
+**Per series (symbol, type, interval):**
+1. Read the existing output CSV from the cloned dataset → `last_dt = max(time_col)`, or `None` if the file is absent/empty (→ full backfill).
+2. `end` = yesterday UTC (today's daily dump isn't published until tomorrow).
+3. Enumerate the needed periods between `last_dt` (or the type's floor) and `end`, download each, skip 404s, concat, then merge into the existing file (dedup on `time_col`).
+
+**Enumeration = monthly for bulk + daily for the tail** (avoids day-by-day over years):
+
+| Type | Bulk unit | Tail unit | Floor (walk start when empty) |
+|------|-----------|-----------|-------------------------------|
+| klines / mark / index / premium | monthly (`monthly/…/{SYM}-{iv}-{YYYY-MM}.zip`) | daily for the current month | `2020-01` |
+| funding rate | monthly (`monthly/fundingRate/…`) | — (monthly re-fetched each run) | `2020-01` |
+| metrics | **daily only** (no monthly dump exists) | daily | `2021-01` |
+
+- **Backfill** (`last_dt is None`): walk monthly zips from the floor to the last complete month (skip 404s before the symbol's listing date), then daily zips for the current month. Metrics walks **daily** from its floor.
+- **Incremental** (`last_dt` recent): the same walk, but starting at `last_dt`'s period — so a one-day gap fetches one daily file and a three-month outage fetches three monthly files + the current month's days. Self-healing regardless of how many runs were missed.
+- Per-symbol memo of the first month that returns 200, reused across that symbol's intervals/variants, to prune 404 probes before its listing date.
+
+**Multi-run backfill (soft time budget).** A full first backfill is ~200k small downloads (metrics daily-only from 2021 dominates at ~88k) and won't fit one 6h CI run. Rather than a single giant run, the job carries a **soft wall-clock budget** (`MAX_RUNTIME_MIN`, default ~90): once exceeded it stops starting new series, then merges + uploads what it has. Because enumeration is gap-aware, the **next run resumes exactly where this one stopped** — the backfill converges over several daily runs, and steady state stays cheap. One upload per run keeps HF commit count sane (the workflow's squash step collapses history).
+
+**Concurrency.** Downloads are network-bound, so the thread pool is raised well above `cpu_count()` (e.g. 32) for the fetch phase.
+
+**Robustness.** 404 = skip (delisted symbols, pre-listing dates, intervals a variant lacks); only genuine network/parse errors retry. Header-aware CSV loader (current dumps have a header row; older ones don't). Generate `data/README.md` from a template if absent (file-naming + `load_dataset` usage), then stamp "Last updated on".
+
+**Per-type toggles.** Each data category (klines / markPrice / indexPrice / premiumIndex / metrics / fundingRate) and the interval list are config constants, so the heavy variants can be trimmed or disabled without code changes.
 
 ## Workflow (`USDT-M_Perpetual_Futures_update.yaml`)
 
 Copy of `update.yaml` with:
 - Clone `https://…@huggingface.co/datasets/linxy/USDT-M_Perpetual_Futures` into `data`.
 - Run `USDT-M_Perpetual_Futures_updater.py`.
-- Drop `BINANCE_API_KEY` / `BINANCE_API_SECRET` env (unused); keep `HF_TOKEN`.
+- Drop `BINANCE_API_KEY` / `BINANCE_API_SECRET` env (unused); keep `HF_TOKEN`; add `MAX_RUNTIME_MIN` (soft budget, default ~90).
+- Raise `timeout-minutes` toward the GH Actions max (~350) so the soft budget — not the hard kill — ends each run and progress is always uploaded.
 - Keep the history-squash step (repo-size control).
 - Cron offset a couple hours from the spot job (e.g. `0 2 * * *`) so the two daily jobs don't hit HF simultaneously.
 
@@ -101,6 +129,6 @@ No new dependencies required — `pandas`, `requests`, `huggingface_hub`, and `x
 
 ## Out of scope
 
-- Full historical backfill (enabled via `LOOKBACK_DAYS` but run manually, not by the daily cron).
 - Additional bulk datasets not requested (aggTrades, trades, bookDepth, bookTicker, liquidationSnapshot).
 - Any change to the existing spot `updater.py` / `update.yaml`.
+- Using the S3 XML listing API for enumeration — rejected because it's region-blocked/untestable from the dev environment; the walk-from-floor approach uses only the CDN, which is reachable everywhere the CI job and the maintainer run.
