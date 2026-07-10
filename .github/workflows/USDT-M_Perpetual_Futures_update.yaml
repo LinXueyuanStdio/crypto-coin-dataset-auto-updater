@@ -1,0 +1,72 @@
+name: Update USDT-M Perpetual Futures Dataset
+
+on:
+  # Offset a couple of hours from the spot job so they don't hit HF at once
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+jobs:
+  update-futures-dataset:
+    runs-on: ubuntu-latest
+    # Raise toward the GH Actions max so the script's soft MAX_RUNTIME_MIN
+    # budget (not the hard kill) ends each run and progress is uploaded.
+    timeout-minutes: 350
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+
+      - name: Install Poetry
+        run: pip install poetry
+
+      - name: Update Poetry lock file
+        run: poetry lock
+
+      - name: Install project dependencies
+        run: poetry install
+
+      - name: Clone the dataset repository
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: git clone https://hf_user:${HF_TOKEN}@huggingface.co/datasets/linxy/USDT-M_Perpetual_Futures data
+
+      - name: Run the futures dataset update script with retries
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          MAX_RUNTIME_MIN: "300"
+          PYTHONUNBUFFERED: "1"
+        run: |
+          max_retries=5
+          retry=0
+          until poetry run python "USDT-M_Perpetual_Futures_updater.py"; do
+            retry=$((retry + 1))
+            if [ "$retry" -ge "$max_retries" ]; then
+              echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] updater failed $retry times, giving up."
+              exit 1
+            fi
+            echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Update failed (attempt $retry/$max_retries), retrying in 30s..."
+            sleep 30
+          done
+
+      - name: Squash dataset repository history to a single commit
+        working-directory: data
+        run: |
+          set -e
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          BRANCH=$(git rev-parse --abbrev-ref HEAD)
+          git fetch origin "$BRANCH"
+          git reset --hard "origin/$BRANCH"
+          BEFORE_SHA=$(git rev-parse HEAD)
+          git checkout --orphan squash-tmp
+          git add -A
+          git commit -m "Squash history to reduce repository size (was ${BEFORE_SHA}, $(date -u +%Y-%m-%dT%H:%M:%SZ))"
+          git branch -D "$BRANCH"
+          git branch -m "$BRANCH"
+          git push origin "$BRANCH" --force-with-lease="$BRANCH:$BEFORE_SHA"
