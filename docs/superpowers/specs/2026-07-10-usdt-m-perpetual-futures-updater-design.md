@@ -109,7 +109,7 @@ The fetch range is derived **per output file** from the data already stored — 
 
 **Concurrency.** Downloads are network-bound, so the thread pool is raised well above `cpu_count()` (e.g. 32) for the fetch phase.
 
-**Robustness.** 404 = skip (delisted symbols, pre-listing dates, intervals a variant lacks); only genuine network/parse errors retry. Header-aware CSV loader (current dumps have a header row; older ones don't). Generate `data/README.md` from a template if absent (file-naming + `load_dataset` usage), then stamp "Last updated on".
+**Robustness.** 404 = skip (delisted symbols, pre-listing dates, intervals a variant lacks); only genuine network/parse errors retry. **Missing-monthly daily fallback:** if a needed monthly zip is absent (e.g. a recently-ended month whose bulk file isn't published yet), the kline family falls back to that month's daily dumps so a multi-month catch-up never silently skips a month; funding (no daily dump) cannot fall back and retries next run once its monthly zip appears. Header-aware CSV loader (current dumps have a header row; older ones don't). Generate `data/README.md` from a template if absent (file-naming + `load_dataset` usage), then stamp "Last updated on".
 
 **Per-type toggles.** Each data category (klines / markPrice / indexPrice / premiumIndex / metrics / fundingRate) and the interval list are config constants, so the heavy variants can be trimmed or disabled without code changes.
 
