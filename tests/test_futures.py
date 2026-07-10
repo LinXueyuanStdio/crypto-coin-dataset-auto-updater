@@ -123,3 +123,47 @@ def test_enumerate_nothing_when_up_to_date(fut):
     kl = _by_name(fut, "klines")
     months, days = fut.enumerate_periods(kl, _dt.datetime(2026, 7, 9), _dt.date(2026, 7, 8))
     assert months == [] and days == []
+
+
+import io as _io
+import zipfile as _zip
+
+
+def _zip_bytes(csv_text):
+    buf = _io.BytesIO()
+    with _zip.ZipFile(buf, "w") as z:
+        z.writestr("data.csv", csv_text)
+    return buf.getvalue()
+
+
+def test_read_zip_csv_with_header(fut):
+    text = "open_time,open,high,low,close,volume,close_time,quote_volume,count,taker_buy_volume,taker_buy_quote_volume,ignore\n1783468800000,1,2,0,1,5,1783555199999,10,3,4,6,0\n"
+    df = fut.read_zip_csv(_zip_bytes(text), list(fut.KLINE_COLUMNS))
+    assert list(df.columns) == list(fut.KLINE_COLUMNS)
+    assert len(df) == 1
+    assert df.iloc[0]["open_time"] == "1783468800000"
+
+
+def test_read_zip_csv_without_header(fut):
+    text = "1783468800000,1,2,0,1,5,1783555199999,10,3,4,6,0\n"
+    df = fut.read_zip_csv(_zip_bytes(text), list(fut.KLINE_COLUMNS))
+    assert len(df) == 1
+    assert df.iloc[0]["close_time"] == "1783555199999"
+
+
+def test_normalize_times_klines_ms(fut):
+    kl = _by_name(fut, "klines")
+    text = "open_time,open,high,low,close,volume,close_time,quote_volume,count,taker_buy_volume,taker_buy_quote_volume,ignore\n1783468800000,1,2,0,1,5,1783555199999,10,3,4,6,0\n"
+    df = fut.normalize_times(fut.read_zip_csv(_zip_bytes(text), list(fut.KLINE_COLUMNS)), kl)
+    import pandas as pd
+    assert pd.api.types.is_datetime64_any_dtype(df["open_time"])
+    assert str(df.iloc[0]["open_time"]) == "2026-07-08 00:00:00"
+
+
+def test_normalize_times_metrics_string(fut):
+    me = _by_name(fut, "metrics")
+    text = "create_time,symbol,sum_open_interest,sum_open_interest_value,count_toptrader_long_short_ratio,sum_toptrader_long_short_ratio,count_long_short_ratio,sum_taker_long_short_vol_ratio\n2026-07-08 00:05:00,BTCUSDT,99414.3,6303136243.2,1.58,1.39,1.42,1.75\n"
+    df = fut.normalize_times(fut.read_zip_csv(_zip_bytes(text), list(fut.METRICS_COLUMNS)), me)
+    import pandas as pd
+    assert pd.api.types.is_datetime64_any_dtype(df["create_time"])
+    assert str(df.iloc[0]["create_time"]) == "2026-07-08 00:05:00"

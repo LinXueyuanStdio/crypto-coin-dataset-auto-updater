@@ -143,3 +143,19 @@ def enumerate_periods(dt, last_dt, end_date):
             days.append(d)
             d += timedelta(days=1)
     return months, days
+
+
+def read_zip_csv(content, columns):
+    df = pd.read_csv(io.BytesIO(content), compression="zip", header=None, dtype=str)
+    if len(df) and str(df.iloc[0, 0]).strip() == columns[0]:
+        df = df.iloc[1:].reset_index(drop=True)
+    df.columns = columns
+    return df
+
+
+def normalize_times(df, dt):
+    for col in dt.ms_time_cols:
+        df[col] = pd.to_datetime(pd.to_numeric(df[col], errors="coerce"), unit="ms")
+    if dt.time_col not in dt.ms_time_cols:
+        df[dt.time_col] = pd.to_datetime(df[dt.time_col], errors="coerce")
+    return df
