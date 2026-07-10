@@ -80,3 +80,34 @@ def output_filename(dt, symbol, interval):
             return f"{symbol}_{dt.output_suffix}_{interval}.csv"
         return f"{symbol}_{interval}.csv"
     return f"{symbol}_{dt.output_suffix}.csv"
+
+
+def parse_ym(s):
+    y, m = s.split("-")
+    return int(y), int(m)
+
+
+def next_month(y, m):
+    return (y + 1, 1) if m == 12 else (y, m + 1)
+
+
+def months_range(start_ym, end_ym_exclusive):
+    out = []
+    cur = start_ym
+    while cur < end_ym_exclusive:
+        out.append(cur)
+        cur = next_month(*cur)
+    return out
+
+
+def file_url(dt, symbol, interval, freq, period):
+    if freq == "monthly":
+        y, m = period
+        stamp = f"{y:04d}-{m:02d}"
+    else:
+        stamp = period.isoformat()  # datetime.date -> "YYYY-MM-DD"
+    if dt.per_interval:
+        base = f"{BASE_URL}/{freq}/{dt.path_segment}/{symbol}/{interval}"
+        return f"{base}/{symbol}-{interval}-{stamp}.zip"
+    base = f"{BASE_URL}/{freq}/{dt.path_segment}/{symbol}"
+    return f"{base}/{symbol}-{dt.path_segment}-{stamp}.zip"

@@ -36,3 +36,42 @@ def test_output_filename(fut):
 def test_symbols_and_intervals(fut):
     assert "BTCUSDT" in fut.SYMBOLS and "ETHUSDT" in fut.SYMBOLS
     assert fut.INTERVALS[0] == "1d" and "5m" in fut.INTERVALS
+
+
+import datetime as _dt
+
+
+def test_month_helpers(fut):
+    assert fut.parse_ym("2021-01") == (2021, 1)
+    assert fut.next_month(2020, 12) == (2021, 1)
+    assert fut.next_month(2020, 5) == (2020, 6)
+    assert fut.months_range((2020, 11), (2021, 2)) == [(2020, 11), (2020, 12), (2021, 1)]
+    assert fut.months_range((2021, 5), (2021, 5)) == []
+
+
+def test_file_url_klines(fut):
+    kl = next(dt for dt in fut.DATA_TYPES if dt.name == "klines")
+    assert fut.file_url(kl, "BTCUSDT", "1d", "daily", _dt.date(2026, 7, 8)) == (
+        "https://data.binance.vision/data/futures/um/daily/klines/BTCUSDT/1d/BTCUSDT-1d-2026-07-08.zip"
+    )
+    assert fut.file_url(kl, "BTCUSDT", "1h", "monthly", (2025, 5)) == (
+        "https://data.binance.vision/data/futures/um/monthly/klines/BTCUSDT/1h/BTCUSDT-1h-2025-05.zip"
+    )
+
+
+def test_file_url_markprice_uses_variant_only_in_path(fut):
+    mp = next(dt for dt in fut.DATA_TYPES if dt.name == "markPrice")
+    assert fut.file_url(mp, "BTCUSDT", "1h", "daily", _dt.date(2026, 7, 6)) == (
+        "https://data.binance.vision/data/futures/um/daily/markPriceKlines/BTCUSDT/1h/BTCUSDT-1h-2026-07-06.zip"
+    )
+
+
+def test_file_url_metrics_and_funding(fut):
+    me = next(dt for dt in fut.DATA_TYPES if dt.name == "metrics")
+    fr = next(dt for dt in fut.DATA_TYPES if dt.name == "fundingRate")
+    assert fut.file_url(me, "BTCUSDT", None, "daily", _dt.date(2026, 7, 8)) == (
+        "https://data.binance.vision/data/futures/um/daily/metrics/BTCUSDT/BTCUSDT-metrics-2026-07-08.zip"
+    )
+    assert fut.file_url(fr, "BTCUSDT", None, "monthly", (2026, 6)) == (
+        "https://data.binance.vision/data/futures/um/monthly/fundingRate/BTCUSDT/BTCUSDT-fundingRate-2026-06.zip"
+    )
