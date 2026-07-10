@@ -185,13 +185,13 @@ class _Resp:
 
 def test_download_200_returns_df(fut, monkeypatch):
     text = "open_time,open,high,low,close,volume,close_time,quote_volume,count,taker_buy_volume,taker_buy_quote_volume,ignore\n1,1,2,0,1,5,2,10,3,4,6,0\n"
-    monkeypatch.setattr(fut.requests, "get", lambda url, timeout=30: _Resp(200, _zip_bytes(text)))
+    monkeypatch.setattr(fut.SESSION, "get", lambda url, timeout=30: _Resp(200, _zip_bytes(text)))
     df = fut.download_series_file("http://x/y.zip", list(fut.KLINE_COLUMNS))
     assert df is not None and len(df) == 1
 
 
 def test_download_404_returns_none(fut, monkeypatch):
-    monkeypatch.setattr(fut.requests, "get", lambda url, timeout=30: _Resp(404))
+    monkeypatch.setattr(fut.SESSION, "get", lambda url, timeout=30: _Resp(404))
     assert fut.download_series_file("http://x/missing.zip", list(fut.KLINE_COLUMNS)) is None
 
 
@@ -202,7 +202,7 @@ def test_download_retries_then_raises(fut, monkeypatch):
         calls["n"] += 1
         raise fut.requests.ConnectionError("network down")
 
-    monkeypatch.setattr(fut.requests, "get", boom)
+    monkeypatch.setattr(fut.SESSION, "get", boom)
     monkeypatch.setattr(fut.time, "sleep", lambda s: None)
     import pytest
     with pytest.raises(fut.requests.RequestException):

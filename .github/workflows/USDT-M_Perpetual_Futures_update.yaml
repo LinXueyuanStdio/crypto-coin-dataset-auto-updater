@@ -41,6 +41,8 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           MAX_RUNTIME_MIN: "300"
           PYTHONUNBUFFERED: "1"
+          # The script defaults PROXY to a local dev proxy; disable it on CI.
+          PROXY: ""
         run: |
           max_retries=5
           retry=0

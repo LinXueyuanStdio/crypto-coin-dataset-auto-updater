@@ -8,11 +8,36 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 
 import requests
+from requests.adapters import HTTPAdapter
 import pandas as pd
 from huggingface_hub import HfApi
 
 # ----- logging (handlers attached lazily in __main__ to keep import side-effect-free) -----
 logger = logging.getLogger("futures_updater")
+
+# ----- HTTP session + optional auto-proxy -----
+# A single pooled Session reuses connections (HTTP keep-alive) so high
+# concurrency through a local proxy does not exhaust OS sockets (on Windows,
+# a new connection per request quickly triggers WinError 10048). PROXY defaults
+# to a local dev proxy for convenience; CI sets PROXY="" to disable it. When
+# set it is applied to BOTH the CDN downloads (this session, via the process
+# env at request time) and the Hugging Face upload (huggingface_hub reads the
+# same env), so a plain `python USDT-M_Perpetual_Futures_updater.py` just works.
+PROXY = os.getenv("PROXY", "http://127.0.0.1:4780")
+
+SESSION = requests.Session()
+_adapter = HTTPAdapter(pool_connections=16, pool_maxsize=64)
+SESSION.mount("https://", _adapter)
+SESSION.mount("http://", _adapter)
+
+
+def configure_proxy():
+    """Route both CDN downloads and the HF upload through PROXY, if set."""
+    if PROXY:
+        os.environ["HTTP_PROXY"] = PROXY
+        os.environ["HTTPS_PROXY"] = PROXY
+        logger.info("Using proxy %s", PROXY)
+
 
 # ----- config -----
 BASE_URL = "https://data.binance.vision/data/futures/um"
@@ -175,7 +200,7 @@ def normalize_times(df, dt):
 def download_series_file(url, columns, max_retries=3, timeout=30):
     for attempt in range(max_retries):
         try:
-            resp = requests.get(url, timeout=timeout)
+            resp = SESSION.get(url, timeout=timeout)
             if resp.status_code == 404:
                 return None
             resp.raise_for_status()
@@ -344,7 +369,7 @@ def run_update(data_folder, end_date=None, budget=None, max_workers=None):
     if budget is None:
         budget = Budget(float(os.getenv("MAX_RUNTIME_MIN", "90")))
     if max_workers is None:
-        max_workers = int(os.getenv("FETCH_WORKERS", "32"))
+        max_workers = int(os.getenv("FETCH_WORKERS", "8" if PROXY else "32"))
 
     jobs = iter(build_jobs())
     produced = 0
@@ -393,6 +418,7 @@ def upload(upload_folder, dataset_slug, version_notes):
 
 
 def main():
+    configure_proxy()
     dataset_slug = os.getenv("DATASET_SLUG", "linxy/USDT-M_Perpetual_Futures")
     data_folder = os.path.join(BASE_DIR, os.getenv("DATA_DIR", "data"))
     os.makedirs(data_folder, exist_ok=True)
