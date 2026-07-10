@@ -175,3 +175,19 @@ def download_series_file(url, columns, max_retries=3, timeout=30):
             else:
                 raise
     return None
+
+
+def fetch_series(dt, symbol, interval, last_dt, end_date, downloader=download_series_file):
+    months, days = enumerate_periods(dt, last_dt, end_date)
+    frames = []
+    for period in months:
+        frame = downloader(file_url(dt, symbol, interval, "monthly", period), list(dt.columns))
+        if frame is not None and len(frame):
+            frames.append(frame)
+    for day in days:
+        frame = downloader(file_url(dt, symbol, interval, "daily", day), list(dt.columns))
+        if frame is not None and len(frame):
+            frames.append(frame)
+    if not frames:
+        return None
+    return normalize_times(pd.concat(frames, ignore_index=True), dt)

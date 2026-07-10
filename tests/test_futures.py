@@ -205,3 +205,39 @@ def test_download_retries_then_raises(fut, monkeypatch):
     with pytest.raises(fut.requests.RequestException):
         fut.download_series_file("http://x/y.zip", list(fut.KLINE_COLUMNS), max_retries=3)
     assert calls["n"] == 3
+
+
+def test_fetch_series_concats_and_normalizes(fut):
+    kl = _by_name(fut, "klines")
+    import pandas as pd
+
+    def fake_dl(url, columns):
+        # extract date from last 3 dash-separated segments e.g. ...BTCUSDT-1d-2026-07-06.zip
+        day = "-".join(url.split("-")[-3:]).replace(".zip", "")
+        ts = int(pd.Timestamp(day, tz="UTC").timestamp() * 1000)
+        row = [str(ts), "1", "2", "0", "1", "5", str(ts + 1), "10", "3", "4", "6", "0"]
+        return pd.DataFrame([row], columns=list(kl.columns))
+
+    df = fut.fetch_series(kl, "BTCUSDT", "1d", _dt.datetime(2026, 7, 6), _dt.date(2026, 7, 8), downloader=fake_dl)
+    assert df is not None
+    assert len(df) == 3
+    assert pd.api.types.is_datetime64_any_dtype(df["open_time"])
+
+
+def test_fetch_series_returns_none_when_all_404(fut):
+    kl = _by_name(fut, "klines")
+    df = fut.fetch_series(kl, "BTCUSDT", "1d", _dt.datetime(2026, 7, 6), _dt.date(2026, 7, 8),
+                          downloader=lambda url, columns: None)
+    assert df is None
+
+
+def test_fetch_series_empty_range_returns_none(fut):
+    kl = _by_name(fut, "klines")
+    called = {"n": 0}
+
+    def dl(url, columns):
+        called["n"] += 1
+        return None
+
+    df = fut.fetch_series(kl, "BTCUSDT", "1d", _dt.datetime(2026, 7, 9), _dt.date(2026, 7, 8), downloader=dl)
+    assert df is None and called["n"] == 0
