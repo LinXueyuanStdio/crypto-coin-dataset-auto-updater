@@ -113,6 +113,10 @@ The fetch range is derived **per output file** from the data already stored — 
 
 **Per-type toggles.** Each data category (klines / markPrice / indexPrice / premiumIndex / metrics / fundingRate) and the interval list are config constants, so the heavy variants can be trimmed or disabled without code changes.
 
+## Known limitations
+
+- **Funding rate lags up to one month intra-month.** Binance publishes funding rate only as **monthly** bulk dumps, and a given month's zip appears only after that month completes (verified: `monthly/fundingRate/.../2026-07.zip` → 404 mid-July; `.../2026-06.zip` → 200). There is **no daily funding dump** (verified 404). So within the current month, the newest funding data available in bulk is through the end of the last completed month; the current month's rows land once the month closes and the next run picks them up. The geo-safe REST alternative (`fapi/v1/fundingRate`) is unavailable (451 from CI), so this lag is inherent. Klines and metrics are daily dumps and only lag ~T+1.
+
 ## Workflow (`USDT-M_Perpetual_Futures_update.yaml`)
 
 Copy of `update.yaml` with:
