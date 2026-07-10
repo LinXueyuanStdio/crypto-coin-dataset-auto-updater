@@ -270,3 +270,53 @@ def test_merge_datasets_no_existing(fut, tmp_path):
     out = tmp_path / "out.csv"
     merged = fut.merge_datasets(str(tmp_path / "absent.csv"), str(newf), str(out), "calc_time")
     assert len(merged) == 1 and out.exists()
+
+
+def test_budget(fut):
+    assert fut.Budget(0).exceeded() is True
+    assert fut.Budget(1000).exceeded() is False
+
+
+def test_build_jobs_counts(fut):
+    jobs = fut.build_jobs()
+    per_interval_types = sum(1 for dt in fut.DATA_TYPES if dt.per_interval and dt.enabled)
+    flat_types = sum(1 for dt in fut.DATA_TYPES if not dt.per_interval and dt.enabled)
+    expected = len(fut.SYMBOLS) * (per_interval_types * len(fut.INTERVALS) + flat_types)
+    assert len(jobs) == expected
+    assert any(j.symbol == "BTCUSDT" and j.dt.name == "metrics" and j.interval is None for j in jobs)
+
+
+def test_process_job_writes_then_resumes(fut, tmp_path, monkeypatch):
+    import pandas as pd
+    kl = _by_name(fut, "klines")
+
+    # first run: nothing stored -> fake fetch returns 2 rows
+    def fetch_first(dt, symbol, interval, last_dt, end_date, downloader=None):
+        assert last_dt is None
+        return pd.DataFrame({
+            "open_time": pd.to_datetime(["2026-07-01", "2026-07-02"]),
+            "close": ["1", "2"],
+        })
+
+    monkeypatch.setattr(fut, "fetch_series", fetch_first)
+    path = fut.process_job(kl, "BTCUSDT", "1d", str(tmp_path), _dt.date(2026, 7, 2))
+    assert path is not None and pd.read_csv(path).shape[0] == 2
+
+    # second run: last stored is 2026-07-02 -> fetch returns overlap + 1 new
+    def fetch_second(dt, symbol, interval, last_dt, end_date, downloader=None):
+        assert last_dt is not None and last_dt.day == 2
+        return pd.DataFrame({
+            "open_time": pd.to_datetime(["2026-07-02", "2026-07-03"]),
+            "close": ["2", "3"],
+        })
+
+    monkeypatch.setattr(fut, "fetch_series", fetch_second)
+    fut.process_job(kl, "BTCUSDT", "1d", str(tmp_path), _dt.date(2026, 7, 3))
+    df = pd.read_csv(path)
+    assert df.shape[0] == 3  # deduped 2026-07-02
+
+
+def test_process_job_none_when_no_new_data(fut, tmp_path, monkeypatch):
+    kl = _by_name(fut, "klines")
+    monkeypatch.setattr(fut, "fetch_series", lambda *a, **k: None)
+    assert fut.process_job(kl, "BTCUSDT", "1d", str(tmp_path), _dt.date(2026, 7, 3)) is None

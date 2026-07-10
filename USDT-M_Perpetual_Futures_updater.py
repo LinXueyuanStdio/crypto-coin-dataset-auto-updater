@@ -226,3 +226,46 @@ def merge_datasets(existing_file, new_file, output_file, time_col):
     merged = merge_frames(existing_df, new_df, time_col)
     merged.to_csv(output_file, index=False)
     return merged
+
+
+class Budget:
+    def __init__(self, minutes):
+        self.limit_seconds = float(minutes) * 60.0
+        self.start = time.monotonic()
+
+    def exceeded(self):
+        return (time.monotonic() - self.start) >= self.limit_seconds
+
+
+@dataclass
+class Job:
+    dt: DataType
+    symbol: str
+    interval: object  # str | None
+
+
+def build_jobs():
+    jobs = []
+    for symbol in SYMBOLS:
+        for dt in DATA_TYPES:
+            if not dt.enabled:
+                continue
+            if dt.per_interval:
+                for interval in INTERVALS:
+                    jobs.append(Job(dt, symbol, interval))
+            else:
+                jobs.append(Job(dt, symbol, None))
+    return jobs
+
+
+def process_job(dt, symbol, interval, data_folder, end_date, downloader=download_series_file):
+    out_name = output_filename(dt, symbol, interval)
+    data_path = os.path.join(data_folder, out_name)
+    last_dt = latest_stored_time(data_path, dt.time_col)
+    new_df = fetch_series(dt, symbol, interval, last_dt, end_date, downloader=downloader)
+    if new_df is None or new_df.empty:
+        return None
+    existing_df = pd.read_csv(data_path) if os.path.exists(data_path) else None
+    merged = merge_frames(existing_df, new_df, dt.time_col)
+    merged.to_csv(data_path, index=False)
+    return data_path
