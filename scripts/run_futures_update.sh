@@ -49,11 +49,12 @@ push_progress() {
     # Stage everything …
     git -C "$DATA_DIR" add -A
 
-    # … then move any new/changed CSV > 10 MiB to git-lfs (HF rejects >10MiB in git).
-    # Small CSVs stay in plain git for fast downloads.
+    # HF rejects files >10 MiB in plain git.  Track anything ≥ 9.9 MiB
+    # so they flip to LFS just before hitting the limit.
+    LFS_THRESHOLD=$((99 * 1024 * 1024 / 10))
     large=$(git -C "$DATA_DIR" diff --cached --name-only --diff-filter=ACM | while IFS= read -r f; do
         sz=$(stat -c%s "$DATA_DIR/$f" 2>/dev/null || echo 0)
-        if [ "$sz" -gt 10485760 ]; then echo "$f"; fi
+        if [ "$sz" -ge "$LFS_THRESHOLD" ]; then echo "$f"; fi
     done)
     if [ -n "$large" ]; then
         echo "$large" | while IFS= read -r f; do
@@ -61,7 +62,7 @@ push_progress() {
         done
         git -C "$DATA_DIR" add .gitattributes 2>/dev/null || true
         git -C "$DATA_DIR" add -A   # re-stage the now-LFS-tracked files
-        log "LFS-tracked $(echo "$large" | wc -l) large CSV(s)"
+        log "LFS-tracked $(echo "$large" | wc -l) file(s) ≥5 MiB"
     fi
 
     if git -C "$DATA_DIR" commit -m "auto-save $(date -u +%Y-%m-%dT%H:%M:%SZ)" 2>&1; then
