@@ -41,13 +41,14 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           MAX_RUNTIME_MIN: "300"
           FETCH_WORKERS: "64"
+          PUSH_INTERVAL_SEC: "1800"
           PYTHONUNBUFFERED: "1"
           # The script defaults PROXY to a local dev proxy; disable it on CI.
           PROXY: ""
         run: |
           max_retries=5
           retry=0
-          until poetry run python "USDT-M_Perpetual_Futures_updater.py"; do
+          until bash scripts/run_futures_update.sh; do
             retry=$((retry + 1))
             if [ "$retry" -ge "$max_retries" ]; then
               echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] updater failed $retry times, giving up."

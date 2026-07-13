@@ -517,8 +517,9 @@ def test_resolve_symbols_updates_module_list(fut, monkeypatch, tmp_path):
 def test_fetch_symbols_returns_fallback_on_api_failure(fut, monkeypatch):
     monkeypatch.setattr(fut.SESSION, "get", lambda url, timeout=15: (
         (_ for _ in ()).throw(fut.requests.ConnectionError("offline"))))
-    # No cache -> fallback
+    # No cache and no symbols.json -> ultimate fallback
     monkeypatch.setattr(fut, "SYMBOLS_CACHE", "/nonexistent/cache.json")
+    monkeypatch.setattr(fut, "SYMBOLS_FILE", "/nonexistent/symbols.json")
     symbols = fut.fetch_usdt_perpetual_symbols()
     assert symbols == fut.FALLBACK_SYMBOLS
 
@@ -553,8 +554,21 @@ def test_fetch_symbols_filters_usdt_perpetual_trading(fut, monkeypatch):
 
     monkeypatch.setattr(fut.SESSION, "get", lambda url, timeout=15: FakeResp)
     monkeypatch.setattr(fut, "SYMBOLS_CACHE", "/nonexistent/cache2.json")
+    monkeypatch.setattr(fut, "SYMBOLS_FILE", "/nonexistent/symbols.json")
     symbols = fut.fetch_usdt_perpetual_symbols()
     assert symbols == ["BTCUSDT", "ETHUSDT"]
+
+
+def test_fetch_symbols_falls_back_to_symbols_json(fut, tmp_path, monkeypatch):
+    # API unreachable, no cache -> should read from symbols.json
+    symbols_file = tmp_path / "symbols.json"
+    symbols_file.write_text('{"_fetched_at": 99999999999, "symbols": ["BTCUSDT", "ETHUSDT", "ADAUSDT"]}')
+    monkeypatch.setattr(fut, "SYMBOLS_CACHE", "/nonexistent/cache3.json")
+    monkeypatch.setattr(fut, "SYMBOLS_FILE", str(symbols_file))
+    monkeypatch.setattr(fut.SESSION, "get", lambda url, timeout=15: (
+        (_ for _ in ()).throw(fut.requests.ConnectionError("offline"))))
+    symbols = fut.fetch_usdt_perpetual_symbols()
+    assert symbols == ["ADAUSDT", "BTCUSDT", "ETHUSDT"]
 
 
 def test_build_jobs_uses_current_symbols(fut, monkeypatch):
