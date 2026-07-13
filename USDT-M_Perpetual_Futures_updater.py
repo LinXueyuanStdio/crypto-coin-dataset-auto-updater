@@ -491,14 +491,18 @@ def process_job(dt, symbol, interval, data_folder, end_date, last_dt, downloader
         elapsed = time.monotonic() - t0
         logger.info("[%s] no new data (%.1fs)", label, elapsed)
         return None
+    new_rows = len(new_df)
     existing_df = pd.read_csv(data_path, dtype=str) if os.path.exists(data_path) else None
+    existing_rows = len(existing_df) if existing_df is not None else 0
     merged = merge_frames(existing_df, new_df, dt.time_col)
     merged.to_csv(data_path, index=False)
     new_last = pd.to_datetime(merged[dt.time_col], errors="coerce").max()
     elapsed = time.monotonic() - t0
-    rows = len(merged)
     ts = new_last.strftime("%Y-%m-%d") if new_last is not pd.NaT else "?"
-    logger.info("[%s] done — %d rows through %s (%.1fs)", label, rows, ts, elapsed)
+    logger.info(
+        "[%s] done — +%d new rows (was %d, now %d total through %s) (%.1fs)",
+        label, new_rows, existing_rows, len(merged), ts, elapsed,
+    )
     return data_path, (None if pd.isna(new_last) else new_last.to_pydatetime())
 
 

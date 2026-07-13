@@ -36,6 +36,10 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"; }
 
 push_progress() {
+    if [ -n "$COINS" ]; then
+        log ">>> COINS is set — skipping auto-push (local test mode)"
+        return
+    fi
     log ">>> Auto-pushing progress to HF …"
     # git diff only covers tracked files; status --porcelain catches new files too.
     if [ -n "$(git -C "$DATA_DIR" status --porcelain)" ]; then
