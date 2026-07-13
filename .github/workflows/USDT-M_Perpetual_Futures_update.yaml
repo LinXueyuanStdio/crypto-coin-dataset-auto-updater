@@ -3,7 +3,7 @@ name: Update USDT-M Perpetual Futures Dataset
 on:
   # Offset a couple of hours from the spot job so they don't hit HF at once
   schedule:
-    - cron: "0 2 * * *"
+    - cron: "0 2 * * 6"
   workflow_dispatch:
 
 jobs:
