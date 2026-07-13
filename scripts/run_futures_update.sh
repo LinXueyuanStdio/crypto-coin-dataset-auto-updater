@@ -46,8 +46,14 @@ push_progress() {
     # git diff only covers tracked files; status --porcelain catches new files too.
     if [ -n "$(git -C "$DATA_DIR" status --porcelain)" ]; then
         git -C "$DATA_DIR" add -A
-        git -C "$DATA_DIR" commit -m "auto-save $(date -u +%Y-%m-%dT%H:%M:%SZ)" || true
-        git -C "$DATA_DIR" push origin main 2>&1 || log "WARNING: push failed (will retry later)"
+        if git -C "$DATA_DIR" commit -m "auto-save $(date -u +%Y-%m-%dT%H:%M:%SZ)" 2>&1; then
+            log "Commit OK, pushing …"
+            push_out=$(git -C "$DATA_DIR" push origin main 2>&1) && \
+                log "Push OK: $push_out" || \
+                log "WARNING: push failed: $push_out"
+        else
+            log "Nothing to commit."
+        fi
     else
         log "No changes to push."
     fi
