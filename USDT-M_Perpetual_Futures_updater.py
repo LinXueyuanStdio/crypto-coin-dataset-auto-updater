@@ -513,27 +513,145 @@ SYMBOLS_CACHE = os.path.join(BASE_DIR, ".symbols_cache.json")
 SYMBOLS_FILE = os.path.join(BASE_DIR, "symbols.json")
 SYMBOLS_CACHE_TTL_HOURS = 24
 
-README_TEMPLATE = """# USDT-M Perpetual Futures (Binance)
+README_TEMPLATE = """---
+license: mit
+task_categories:
+- time-series-forecasting
+language:
+- en
+- zh
+tags:
+- finance
+- cryptocurrency
+- futures
+- perpetual
+- binance
+pretty_name: USDT-M Perpetual Futures
+size_categories:
+- 10M<n<100M
+---
 
-Binance USDT-margined perpetual futures data, auto-updated from the public
-`data.binance.vision` bulk data mirror.
+# USDT-M Perpetual Futures (Binance)
 
-币安 U 本位永续合约数据集，自动从 `data.binance.vision` 公共数据镜像更新。
+Binance USDT-margined **perpetual futures** historical data, including OHLCV klines,
+mark / index / premium-index prices, open-interest & long/short ratios, and funding rates.
 
-## Files / 文件
+Auto-updated daily from the official [Binance public data mirror](https://data.binance.vision).
 
-- `{symbol}_{interval}.csv` — OHLCV klines (量价)
-- `{symbol}_markPrice_{interval}.csv` — mark price klines (标记价格)
-- `{symbol}_indexPrice_{interval}.csv` — index price klines (指数价格)
-- `{symbol}_premiumIndex_{interval}.csv` — premium index klines (溢价指数)
-- `{symbol}_metrics.csv` — open interest + long/short ratios + taker buy/sell ratio (持仓量与多空比)
-- `{symbol}_fundingRate.csv` — funding rate history (资金费率)
-- `_index.json` — updater bookkeeping (last timestamp per file; used to update only what changed)
+币安 **U 本位永续合约** 历史数据集，包含 K 线、标记价格、指数价格、溢价指数、持仓量及多空比、资金费率，
+每日从 Binance 官方数据镜像自动更新。
+
+Last updated on `pending`
+
+## Usage
 
 ```python
 from datasets import load_dataset
-dataset = load_dataset("linxy/USDT-M_Perpetual_Futures", data_files=["BTCUSDT_1d.csv"], split="train")
+
+# OHLCV klines
+klines = load_dataset("linxy/USDT-M_Perpetual_Futures", data_files=["BTCUSDT_1d.csv"], split="train")
+
+# Mark price
+mark = load_dataset("linxy/USDT-M_Perpetual_Futures", data_files=["BTCUSDT_markPrice_1d.csv"], split="train")
+
+# Open interest + long/short ratios
+metrics = load_dataset("linxy/USDT-M_Perpetual_Futures", data_files=["BTCUSDT_metrics.csv"], split="train")
+
+# Funding rate
+funding = load_dataset("linxy/USDT-M_Perpetual_Futures", data_files=["BTCUSDT_fundingRate.csv"], split="train")
 ```
+
+## Data Types
+
+| File pattern | Content |
+|---|---|
+| `{symbol}_{interval}.csv` | OHLCV klines |
+| `{symbol}_markPrice_{interval}.csv` | Mark price klines |
+| `{symbol}_indexPrice_{interval}.csv` | Index price klines |
+| `{symbol}_premiumIndex_{interval}.csv` | Premium index klines |
+| `{symbol}_metrics.csv` | Open interest, long/short ratios, taker buy/sell |
+| `{symbol}_fundingRate.csv` | Funding rate history |
+| `{symbol}_info.json` | Per-symbol metadata (precision, tick sizes, sector, etc.) |
+| `meta.json` | Dataset-level metadata (full symbol list, intervals, etc.) |
+| `_index.json` | Updater bookkeeping (internal) |
+
+## Intervals
+
+`1d` `12h` `8h` `6h` `4h` `2h` `1h` `30m` `15m` `5m`
+
+## Kline / Price Fields
+
+| Field | Description |
+|---|---|
+| `open_time` | Interval start timestamp (ms) |
+| `open` | Opening price |
+| `high` | Highest price |
+| `low` | Lowest price |
+| `close` | Closing price |
+| `volume` | Base asset volume |
+| `close_time` | Interval end timestamp (ms) |
+| `quote_volume` | Quote asset (USDT) volume |
+| `count` | Number of trades |
+| `taker_buy_volume` | Taker buy base volume |
+| `taker_buy_quote_volume` | Taker buy quote volume |
+| `ignore` | Placeholder (unused) |
+
+## Metrics Fields
+
+| Field | Description |
+|---|---|
+| `create_time` | Observation timestamp |
+| `symbol` | Trading pair |
+| `sum_open_interest` | Total open interest (base) |
+| `sum_open_interest_value` | Total open interest (USDT) |
+| `count_toptrader_long_short_ratio` | Top-trader long/short accounts ratio |
+| `sum_toptrader_long_short_ratio` | Top-trader long/short positions ratio |
+| `count_long_short_ratio` | Global long/short accounts ratio |
+| `sum_taker_long_short_vol_ratio` | Taker buy/sell volume ratio |
+
+## Funding Rate Fields
+
+| Field | Description |
+|---|---|
+| `calc_time` | Funding timestamp |
+| `funding_interval_hours` | Interval (hours) |
+| `last_funding_rate` | Funding rate |
+
+## Available Symbols
+
+See `meta.json` for the full list.  The dataset covers **all TRADING USDT-M
+perpetual contracts** on Binance Futures (currently {n_symbols} symbols).
+
+## Sources
+
+- **Data:** [data.binance.vision](https://data.binance.vision) (Binance public market-data mirror)
+- **Updater:** [GitHub](https://github.com/LinXueyuanStdio/crypto-coin-dataset-auto-updater)
+- **Processing:** Automated daily incremental updates; monthly bulk zips + daily fallback;
+  new data is merged with existing CSVs and de-duplicated by timestamp.
+
+## Bias, Risks, and Limitations
+
+1. **Exchange-specific bias:** Data reflects Binance's order book only, not global markets.
+2. **Temporal gaps:** Missing data during Binance outages, API failures, or delistings.
+3. **Market volatility:** Cryptocurrency markets are highly volatile — models may be unstable.
+4. **Latency:** Daily bulk dumps are published with a delay; intra-day data is not real-time.
+5. **Delisted symbols:** Some historical contracts were delisted; their data stops at delisting date.
+
+## Citation
+
+```bibtex
+@misc{LinXueyuanStdio2025,
+  title = {USDT-M Perpetual Futures (Binance)},
+  author = {Xueyuan Lin},
+  year = {2025},
+  publisher = {Hugging Face},
+  howpublished = {\\url{https://huggingface.co/datasets/linxy/USDT-M_Perpetual_Futures}},
+}
+```
+
+## Author
+
+- LinXueyuanStdio (GitHub: [@LinXueyuanStdio](https://github.com/LinXueyuanStdio))
 
 Last updated on `pending`
 """
@@ -541,17 +659,24 @@ Last updated on `pending`
 
 def ensure_readme(path):
     if not os.path.exists(path):
+        # Use the full (pre-COINS) symbol count from symbols.json if available.
+        n = len(SYMBOLS)
+        if os.path.exists(SYMBOLS_FILE):
+            try:
+                with open(SYMBOLS_FILE, encoding="utf-8") as f:
+                    n = len(json.load(f).get("symbols", []))
+            except (ValueError, OSError, KeyError):
+                pass
+        body = README_TEMPLATE.replace("{n_symbols}", str(n))
         with open(path, "w", encoding="utf-8") as f:
-            f.write(README_TEMPLATE)
+            f.write(body)
 
 
 def stamp_readme(path):
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            body = f.read()
-    else:
-        body = README_TEMPLATE
+    ensure_readme(path)
+    with open(path, "r", encoding="utf-8") as f:
+        body = f.read()
     if "Last updated on `" in body:
         body = re.sub(r"Last updated on `.*?`", f"Last updated on `{now}`", body)
     else:
