@@ -37,25 +37,40 @@ log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"; }
 
 push_progress() {
     log ">>> Auto-pushing progress to HF …"
-    # Only push if data/ is its own git repo (cloned from HF in CI).
-    # Locally data/ is a plain directory — skip git push.
     if [ ! -d "$DATA_DIR/.git" ]; then
         log "data/ is not a git repo — skipping push (local dev)"
         return
     fi
-    # git diff only covers tracked files; status --porcelain catches new files too.
-    if [ -n "$(git -C "$DATA_DIR" status --porcelain)" ]; then
-        git -C "$DATA_DIR" add -A
-        if git -C "$DATA_DIR" commit -m "auto-save $(date -u +%Y-%m-%dT%H:%M:%SZ)" 2>&1; then
-            log "Commit OK, pushing …"
-            push_out=$(git -C "$DATA_DIR" push origin main 2>&1) && \
-                log "Push OK: $push_out" || \
-                log "WARNING: push failed: $push_out"
-        else
-            log "Nothing to commit."
-        fi
-    else
+    if [ -z "$(git -C "$DATA_DIR" status --porcelain)" ]; then
         log "No changes to push."
+        return
+    fi
+
+    # Stage everything …
+    git -C "$DATA_DIR" add -A
+
+    # … then move any new/changed CSV > 10 MiB to git-lfs (HF rejects >10MiB in git).
+    # Small CSVs stay in plain git for fast downloads.
+    large=$(git -C "$DATA_DIR" diff --cached --name-only --diff-filter=ACM | while IFS= read -r f; do
+        sz=$(stat -c%s "$DATA_DIR/$f" 2>/dev/null || echo 0)
+        if [ "$sz" -gt 10485760 ]; then echo "$f"; fi
+    done)
+    if [ -n "$large" ]; then
+        echo "$large" | while IFS= read -r f; do
+            git -C "$DATA_DIR" lfs track "$f" 2>/dev/null || true
+        done
+        git -C "$DATA_DIR" add .gitattributes 2>/dev/null || true
+        git -C "$DATA_DIR" add -A   # re-stage the now-LFS-tracked files
+        log "LFS-tracked $(echo "$large" | wc -l) large CSV(s)"
+    fi
+
+    if git -C "$DATA_DIR" commit -m "auto-save $(date -u +%Y-%m-%dT%H:%M:%SZ)" 2>&1; then
+        log "Commit OK, pushing …"
+        push_out=$(git -C "$DATA_DIR" push origin main 2>&1) && \
+            log "Push OK: $push_out" || \
+            log "WARNING: push failed: $push_out"
+    else
+        log "Nothing to commit."
     fi
 }
 
@@ -72,8 +87,7 @@ trap cleanup SIGTERM SIGINT SIGHUP
 log "=== Starting futures updater wrapper ==="
 log "Push interval: ${PUSH_INTERVAL_SEC}s  |  Data dir: $DATA_DIR"
 
-# Ensure git user is configured for auto-push commits (the workflow's squash
-# step does this too, but only after the updater finishes — we need it now).
+# Ensure git user is configured for auto-push commits.
 if ! git -C "$DATA_DIR" config user.email >/dev/null 2>&1; then
     git -C "$DATA_DIR" config user.email "github-actions[bot]@users.noreply.github.com"
     git -C "$DATA_DIR" config user.name "github-actions[bot]"
