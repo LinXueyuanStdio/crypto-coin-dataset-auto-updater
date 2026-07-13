@@ -13,7 +13,7 @@
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
-PUSH_INTERVAL_SEC="${PUSH_INTERVAL_SEC:-1800}"
+PUSH_INTERVAL_SEC="${PUSH_INTERVAL_SEC:-600}"
 DATA_DIR="${DATA_DIR:-data}"
 UPDATER_SCRIPT="USDT-M_Perpetual_Futures_updater.py"
 OUTPUT_DIR="${OUTPUT_DIR:-output}"
@@ -36,10 +36,6 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"; }
 
 push_progress() {
-    if [ -n "$COINS" ]; then
-        log ">>> COINS is set — skipping auto-push (local test mode)"
-        return
-    fi
     log ">>> Auto-pushing progress to HF …"
     # git diff only covers tracked files; status --porcelain catches new files too.
     if [ -n "$(git -C "$DATA_DIR" status --porcelain)" ]; then
