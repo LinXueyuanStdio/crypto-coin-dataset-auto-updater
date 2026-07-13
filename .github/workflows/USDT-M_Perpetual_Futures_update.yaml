@@ -41,7 +41,7 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           MAX_RUNTIME_MIN: "300"
           FETCH_WORKERS: "64"
-          PUSH_INTERVAL_SEC: "180"
+          PUSH_INTERVAL_SEC: "60"
           PYTHONUNBUFFERED: "1"
           # The script defaults PROXY to a local dev proxy; disable it on CI.
           PROXY: ""

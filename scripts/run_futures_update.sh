@@ -13,7 +13,7 @@
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
-PUSH_INTERVAL_SEC="${PUSH_INTERVAL_SEC:-180}"
+PUSH_INTERVAL_SEC="${PUSH_INTERVAL_SEC:-60}"
 DATA_DIR="${DATA_DIR:-data}"
 UPDATER_SCRIPT="USDT-M_Perpetual_Futures_updater.py"
 OUTPUT_DIR="${OUTPUT_DIR:-output}"
@@ -46,23 +46,26 @@ push_progress() {
         return
     fi
 
+    # Ensure git-lfs hooks are active before staging anything.
+    git -C "$DATA_DIR" lfs install 2>/dev/null || true
+
+    # Preemptively LFS-track patterns that always grow large (5m/15m/30m
+    # klines + metrics).  These would exceed 10 MiB sooner or later.
+    git -C "$DATA_DIR" lfs track '*_5m.csv' '*_15m.csv' '*_30m.csv' '*_metrics.csv' 2>/dev/null || true
+
     # Stage everything …
     git -C "$DATA_DIR" add -A
 
-    # HF rejects files >10 MiB in plain git.  Track anything ≥ 9.9 MiB
-    # so they flip to LFS just before hitting the limit.
-    LFS_THRESHOLD=$((99 * 1024 * 1024 / 10))
-    large=$(git -C "$DATA_DIR" diff --cached --name-only --diff-filter=ACM | while IFS= read -r f; do
-        sz=$(stat -c%s "$DATA_DIR/$f" 2>/dev/null || echo 0)
-        if [ "$sz" -ge "$LFS_THRESHOLD" ]; then echo "$f"; fi
-    done)
+    # Catch any remaining CSV ≥ 9 MiB that didn't match the patterns above
+    # (e.g. new intervals, fundingRate for very active coins).
+    large=$(find "$DATA_DIR" -name '*.csv' -size +9M -printf '%P\n' 2>/dev/null)
     if [ -n "$large" ]; then
         echo "$large" | while IFS= read -r f; do
             git -C "$DATA_DIR" lfs track "$f" 2>/dev/null || true
         done
         git -C "$DATA_DIR" add .gitattributes 2>/dev/null || true
-        git -C "$DATA_DIR" add -A   # re-stage the now-LFS-tracked files
-        log "LFS-tracked $(echo "$large" | wc -l) file(s) ≥5 MiB"
+        git -C "$DATA_DIR" add -A   # re-stage — large files become LFS pointers
+        log "LFS-tracked $(echo "$large" | wc -l) extra file(s) ≥9 MiB"
     fi
 
     if git -C "$DATA_DIR" commit -m "auto-save $(date -u +%Y-%m-%dT%H:%M:%SZ)" 2>&1; then
