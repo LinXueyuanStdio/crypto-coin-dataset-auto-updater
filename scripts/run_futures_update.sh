@@ -44,6 +44,14 @@ trap cleanup SIGTERM SIGINT SIGHUP
 log "=== Starting futures updater wrapper ==="
 log "Push interval: ${PUSH_INTERVAL_SEC}s  |  Data dir: $DATA_DIR"
 
+# Ensure git user is configured for auto-push commits (the workflow's squash
+# step does this too, but only after the updater finishes — we need it now).
+if ! git -C "$DATA_DIR" config user.email >/dev/null 2>&1; then
+    git -C "$DATA_DIR" config user.email "github-actions[bot]@users.noreply.github.com"
+    git -C "$DATA_DIR" config user.name "github-actions[bot]"
+    log "Configured git user in $DATA_DIR"
+fi
+
 # Launch the Python updater in the background.
 poetry run python "$UPDATER_SCRIPT" &
 UPDATER_PID=$!
