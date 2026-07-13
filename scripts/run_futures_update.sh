@@ -18,6 +18,9 @@ DATA_DIR="${DATA_DIR:-data}"
 UPDATER_SCRIPT="USDT-M_Perpetual_Futures_updater.py"
 OUTPUT_DIR="${OUTPUT_DIR:-output}"
 LOG_FILE="${LOG_FILE:-${OUTPUT_DIR}/futures_update.log}"
+# COINS: comma-separated list to restrict processing (for quick local tests).
+#   e.g. COINS=BTCUSDT,ETHUSDT bash scripts/run_futures_update.sh
+COINS="${COINS:-}"
 
 # Force UTF-8 everywhere — avoids mojibake in the log file on Windows.
 export PYTHONIOENCODING=utf-8
@@ -66,6 +69,7 @@ if ! git -C "$DATA_DIR" config user.email >/dev/null 2>&1; then
 fi
 
 # Launch the Python updater in the background.
+# COINS (and other env vars) are inherited by the Python process.
 poetry run python "$UPDATER_SCRIPT" &
 UPDATER_PID=$!
 log "Python updater started (PID=$UPDATER_PID)"

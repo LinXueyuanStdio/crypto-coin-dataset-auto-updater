@@ -58,6 +58,37 @@ jobs:
             sleep 30
           done
 
+      - name: Generate run summary
+        if: always()
+        run: |
+          if [ -f output/run_summary.json ]; then
+            poetry run python -c "
+          import json
+          with open('output/run_summary.json') as f:
+              s = json.load(f)
+          print('# USDT-M Perpetual Futures — Run Summary', file=open('output/summary.md','w'))
+          print(f'| Item | Value |', file=open('output/summary.md','a'))
+          print(f'|------|-------|', file=open('output/summary.md','a'))
+          print(f'| Start | {s[\"start_time\"]} |', file=open('output/summary.md','a'))
+          print(f'| End | {s[\"end_time\"]} |', file=open('output/summary.md','a'))
+          print(f'| Elapsed | {s[\"elapsed_seconds\"]}s ({s[\"budget_limit_min\"]}min budget) |', file=open('output/summary.md','a'))
+          print(f'| Series produced | {s[\"produced\"]} |', file=open('output/summary.md','a'))
+          print(f'| Series failed | {s[\"failed\"]} |', file=open('output/summary.md','a'))
+          print(f'| Symbols updated | {s[\"symbols_updated\"]} |', file=open('output/summary.md','a'))
+          print(f'| Remaining (next run) | {s[\"remaining\"]} |', file=open('output/summary.md','a'))
+          print('', file=open('output/summary.md','a'))
+          if s['per_symbol']:
+              print('### Updated symbols', file=open('output/summary.md','a'))
+              print('| Symbol | Updated | Failed |', file=open('output/summary.md','a'))
+              print('|--------|---------|--------|', file=open('output/summary.md','a'))
+              for sym, info in sorted(s['per_symbol'].items()):
+                  print(f'| {sym} | {info[\"updated\"]} | {info[\"failed\"]} |', file=open('output/summary.md','a'))
+          " 2>&1
+            cat output/summary.md >> $GITHUB_STEP_SUMMARY
+          else
+            echo "No run_summary.json found — updater may not have run." >> $GITHUB_STEP_SUMMARY
+          fi
+
       - name: Squash dataset repository history to a single commit
         working-directory: data
         run: |

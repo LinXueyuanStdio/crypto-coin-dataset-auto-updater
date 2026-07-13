@@ -586,6 +586,11 @@ def run_update(data_folder, end_date=None, budget=None, max_workers=None):
     total_pending = len(pending)
     last_log_at = time.monotonic()
     PROGRESS_LOG_EVERY_S = 60  # emit a progress line at most every N seconds
+    t_start = time.monotonic()
+
+    # per-symbol stats for the run summary
+    symbol_updated = {}  # symbol -> list of series filenames that got new data
+    symbol_failed = {}   # symbol -> list of (filename, error) tuples
 
     def submit_next(ex):
         try:
@@ -593,7 +598,7 @@ def run_update(data_folder, end_date=None, budget=None, max_workers=None):
         except StopIteration:
             return False
         fut = ex.submit(process_job, job.dt, job.symbol, job.interval, data_folder, end_date, last_dt)
-        inflight[fut] = filename
+        inflight[fut] = (filename, job.symbol)
         return True
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -603,7 +608,7 @@ def run_update(data_folder, end_date=None, budget=None, max_workers=None):
         while inflight:
             done, _ = wait(set(inflight), return_when=FIRST_COMPLETED)
             for f in done:
-                filename = inflight.pop(f)
+                filename, symbol = inflight.pop(f)
                 try:
                     result = f.result()
                     if result is not None:
@@ -611,17 +616,20 @@ def run_update(data_folder, end_date=None, budget=None, max_workers=None):
                         if new_last is not None:
                             index[filename] = new_last.strftime("%Y-%m-%d %H:%M:%S")
                         produced += 1
+                        symbol_updated.setdefault(symbol, []).append(filename)
                 except Exception as e:
                     failed += 1
+                    symbol_failed.setdefault(symbol, []).append((filename, str(e)))
                     logger.warning("series failed: %s", e)
             now = time.monotonic()
             if now - last_log_at >= PROGRESS_LOG_EVERY_S:
                 done_so_far = produced + failed
                 pct = done_so_far * 100.0 / total_pending if total_pending else 0
-                rate = done_so_far / max((now - last_log_at), 1)
+                elapsed = now - t_start
+                rate = done_so_far / max(elapsed, 1)
                 logger.info(
-                    "progress: %d/%d (%.1f%%) ok=%d fail=%d — %.1f series/s",
-                    done_so_far, total_pending, pct, produced, failed, rate,
+                    "progress: %d/%d (%.1f%%) ok=%d fail=%d elapsed=%.0fs — %.1f series/s",
+                    done_so_far, total_pending, pct, produced, failed, elapsed, rate,
                 )
                 last_log_at = now
             if not budget.exceeded():
@@ -630,7 +638,38 @@ def run_update(data_folder, end_date=None, budget=None, max_workers=None):
                         break
 
     save_index(data_folder, index)
-    logger.info("run_update produced data for %d series; index has %d entries", produced, len(index))
+    elapsed = time.monotonic() - t_start
+    logger.info("run_update produced data for %d series; index has %d entries (%.0fs)", produced, len(index), elapsed)
+
+    # ---- write run summary ----
+    summary = {
+        "start_time": datetime.fromtimestamp(t_start).strftime("%Y-%m-%d %H:%M:%S"),
+        "end_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "elapsed_seconds": round(elapsed, 1),
+        "budget_limit_min": budget.limit_seconds / 60.0,
+        "total_pending": total_pending,
+        "produced": produced,
+        "failed": failed,
+        "remaining": total_pending - produced - failed,
+        "symbols_updated": len(symbol_updated),
+        "symbols_failed": len(symbol_failed),
+        "per_symbol": {
+            sym: {
+                "updated": len(symbol_updated.get(sym, [])),
+                "failed": len(symbol_failed.get(sym, [])),
+                "series": sorted(symbol_updated.get(sym, [])),
+                "errors": [e for _, e in symbol_failed.get(sym, [])],
+            }
+            for sym in sorted(set(list(symbol_updated) + list(symbol_failed)))
+        },
+    }
+    summary_dir = os.path.join(BASE_DIR, "output")
+    os.makedirs(summary_dir, exist_ok=True)
+    summary_path = os.path.join(summary_dir, "run_summary.json")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+    logger.info("Run summary saved to %s", summary_path)
+
     return produced
 
 
@@ -656,6 +695,19 @@ def main():
 
     logger.info("Starting USDT-M perpetual futures update -> %s", dataset_slug)
     resolve_symbols()
+
+    # COINS env var (comma-separated) restricts to a symbol subset.
+    #   e.g. COINS=BTCUSDT,ETHUSDT poetry run python USDT-M_Perpetual_Futures_updater.py
+    coins_filter = os.getenv("COINS", "").strip()
+    if coins_filter:
+        wanted = {c.strip() for c in coins_filter.split(",") if c.strip()}
+        before = len(SYMBOLS)
+        SYMBOLS[:] = [s for s in SYMBOLS if s in wanted]
+        logger.info(
+            "COINS filter: %d symbols → %d (%s)",
+            before, len(SYMBOLS), ", ".join(sorted(wanted)),
+        )
+
     run_update(data_folder)
 
     readme_path = os.path.join(data_folder, "README.md")
@@ -664,6 +716,8 @@ def main():
 
     if not os.getenv("HF_TOKEN"):
         logger.warning("HF_TOKEN not set — skipping upload (local dev run)")
+    elif os.getenv("COINS", "").strip():
+        logger.warning("COINS is set — skipping upload (local test run)")
     else:
         notes = datetime.now(timezone.utc).strftime("Updated at %B %d %Y %H:%M:%S UTC")
         for attempt in range(1, 11):
