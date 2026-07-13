@@ -4,6 +4,7 @@ import os
 import re
 import sys
 import time
+import threading
 import logging
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -587,6 +588,37 @@ def run_update(data_folder, end_date=None, budget=None, max_workers=None):
     return produced
 
 
+PERIODIC_PUSH_INTERVAL_MIN = int(os.getenv("PERIODIC_PUSH_INTERVAL_MIN", "30"))
+
+
+def _periodic_push_worker(data_folder, dataset_slug, stop_event):
+    """Daemon-thread target: upload data/ to HF every PERIODIC_PUSH_INTERVAL_MIN.
+
+    The first push is delayed by one full interval so the updater has time to
+    produce a meaningful batch.  If the HF_TOKEN is missing or the upload
+    fails the error is logged and the thread keeps retrying — the final upload
+    in main() is the authoritative one.
+    """
+    # Wait for the first interval before the initial push.
+    while not stop_event.wait(PERIODIC_PUSH_INTERVAL_MIN * 60):
+        try:
+            api = HfApi(token=os.getenv("HF_TOKEN"))
+            notes = datetime.now(timezone.utc).strftime(
+                "auto-save at %Y-%m-%d %H:%M:%S UTC"
+            )
+            api.upload_folder(
+                folder_path=data_folder,
+                repo_id=dataset_slug,
+                repo_type="dataset",
+                commit_message=notes,
+                commit_description=notes,
+                create_pr=False,
+            )
+            logger.info("Periodic push completed: %s", notes)
+        except Exception as e:
+            logger.warning("Periodic push failed (will retry next interval): %s", e)
+
+
 def upload(upload_folder, dataset_slug, version_notes):
     api = HfApi(token=os.getenv("HF_TOKEN"))
     api.upload_folder(
@@ -608,12 +640,29 @@ def main():
 
     logger.info("Starting USDT-M perpetual futures update -> %s", dataset_slug)
     resolve_symbols()
-    run_update(data_folder)
+
+    # Start periodic auto-save so that if the process is killed (e.g. CI
+    # timeout) we keep whatever data has already been written to disk.
+    stop_event = threading.Event()
+    push_thread = threading.Thread(
+        target=_periodic_push_worker,
+        args=(data_folder, dataset_slug, stop_event),
+        daemon=True,
+    )
+    push_thread.start()
+    logger.info("Periodic auto-save started (every %d min)", PERIODIC_PUSH_INTERVAL_MIN)
+
+    try:
+        run_update(data_folder)
+    finally:
+        stop_event.set()
+        logger.info("Periodic auto-save stopped")
 
     readme_path = os.path.join(data_folder, "README.md")
     ensure_readme(readme_path)
     stamp_readme(readme_path)
 
+    # Final authoritative upload — retry up to 10 times.
     notes = datetime.now(timezone.utc).strftime("Updated at %B %d %Y %H:%M:%S UTC")
     for attempt in range(1, 11):
         try:
