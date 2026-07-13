@@ -27,7 +27,7 @@ logger = logging.getLogger("futures_updater")
 PROXY = os.getenv("PROXY", "http://127.0.0.1:4780")
 
 SESSION = requests.Session()
-_adapter = HTTPAdapter(pool_connections=16, pool_maxsize=64)
+_adapter = HTTPAdapter(pool_connections=32, pool_maxsize=128)
 SESSION.mount("https://", _adapter)
 SESSION.mount("http://", _adapter)
 
@@ -57,16 +57,22 @@ METRICS_COLUMNS = [
 ]
 FUNDING_COLUMNS = ["calc_time", "funding_interval_hours", "last_funding_rate"]
 
-SYMBOLS = [
+# Hardcoded fallback list used when the Binance API is unreachable.
+# Updated 2026-07-13: removed 8 delisted symbols (EOS, FTM, FTT, HNT, LUNA,
+# MATIC->POL, WAVES, XEM) that no longer trade on Binance Futures.
+FALLBACK_SYMBOLS = [
     "1INCHUSDT", "AAVEUSDT", "ADAUSDT", "ALGOUSDT", "AVAXUSDT", "BATUSDT",
     "BCHUSDT", "BNBUSDT", "BTCUSDT", "CHZUSDT", "COMPUSDT", "CRVUSDT",
-    "DOGEUSDT", "DOTUSDT", "EOSUSDT", "ETCUSDT", "ETHUSDT", "FILUSDT",
-    "FTMUSDT", "FTTUSDT", "HBARUSDT", "HNTUSDT", "ICPUSDT", "KSMUSDT",
-    "LDOUSDT", "LINKUSDT", "LTCUSDT", "LUNAUSDT", "MANAUSDT", "MATICUSDT",
+    "DOGEUSDT", "DOTUSDT", "ETCUSDT", "ETHUSDT", "FILUSDT",
+    "HBARUSDT", "ICPUSDT", "KSMUSDT",
+    "LDOUSDT", "LINKUSDT", "LTCUSDT", "MANAUSDT",
     "RUNEUSDT", "SANDUSDT", "1000SHIBUSDT", "SNXUSDT", "SOLUSDT", "SUSHIUSDT",
-    "TRXUSDT", "UNIUSDT", "WAVESUSDT", "XEMUSDT", "XLMUSDT", "XRPUSDT",
+    "TRXUSDT", "UNIUSDT", "XLMUSDT", "XRPUSDT",
     "YFIUSDT", "ZILUSDT", "ZRXUSDT",
 ]
+
+# Mutable module-level list: starts as the fallback, updated by resolve_symbols().
+SYMBOLS = list(FALLBACK_SYMBOLS)
 
 
 @dataclass(frozen=True)
@@ -298,6 +304,95 @@ class Job:
     interval: object  # str | None
 
 
+def fetch_usdt_perpetual_symbols():
+    """Fetch all TRADING USDT-M perpetual symbols from Binance Futures API.
+
+    Returns a sorted list of symbol strings (e.g. ['BTCUSDT', 'ETHUSDT', ...]).
+    Falls back to FALLBACK_SYMBOLS if the API is unreachable or returns no results.
+    Results are cached in SYMBOLS_CACHE for SYMBOLS_CACHE_TTL_HOURS.
+    """
+    # ---- check cache first ----
+    if os.path.exists(SYMBOLS_CACHE):
+        try:
+            with open(SYMBOLS_CACHE, encoding="utf-8") as f:
+                cached = json.load(f)
+            age = time.time() - cached.get("_fetched_at", 0)
+            if age < SYMBOLS_CACHE_TTL_HOURS * 3600:
+                symbols = cached.get("symbols", [])
+                if symbols:
+                    logger.info(
+                        "Using cached symbol list (%d symbols, age=%.1fh)",
+                        len(symbols), age / 3600,
+                    )
+                    return symbols
+        except (ValueError, OSError, KeyError, TypeError):
+            pass
+
+    # ---- fetch from API ----
+    # fapi.binance.com is the futures-specific REST host; the public data
+    # mirror (data-api.binance.vision) doesn't serve exchangeInfo, so we
+    # talk to the API directly. This is a lightweight public GET — it
+    # almost never trips geo-restrictions the way klines do.
+    urls = [
+        "https://fapi.binance.com/fapi/v1/exchangeInfo",
+        "https://api.binance.com/fapi/v1/exchangeInfo",
+    ]
+
+    for url in urls:
+        try:
+            resp = SESSION.get(url, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            symbols = [
+                s["symbol"] for s in data.get("symbols", [])
+                if (s.get("quoteAsset") == "USDT"
+                    and s.get("contractType") == "PERPETUAL"
+                    and s.get("status") == "TRADING")
+            ]
+            symbols.sort()
+            logger.info(
+                "Fetched %d USDT-M perpetual symbols from %s",
+                len(symbols), url,
+            )
+
+            if symbols:
+                # persist to cache
+                try:
+                    with open(SYMBOLS_CACHE, "w", encoding="utf-8") as f:
+                        json.dump(
+                            {"_fetched_at": time.time(), "symbols": symbols},
+                            f,
+                        )
+                except OSError:
+                    pass
+                return symbols
+        except Exception as e:
+            logger.warning("Failed to fetch symbols from %s: %s", url, e)
+
+    # ---- fallback ----
+    logger.warning(
+        "Could not fetch symbol list; falling back to %d hardcoded symbols",
+        len(FALLBACK_SYMBOLS),
+    )
+    return list(FALLBACK_SYMBOLS)
+
+
+def resolve_symbols(force_refresh=False):
+    """Update the module-level SYMBOLS list from the Binance API (or cache).
+
+    Called once at the start of main().  When *force_refresh* is True the
+    on-disk cache is ignored and the API is queried unconditionally.
+    """
+    global SYMBOLS
+    if force_refresh and os.path.exists(SYMBOLS_CACHE):
+        try:
+            os.remove(SYMBOLS_CACHE)
+        except OSError:
+            pass
+    SYMBOLS = fetch_usdt_perpetual_symbols()
+    logger.info("resolve_symbols: %d symbols loaded", len(SYMBOLS))
+
+
 def build_jobs():
     jobs = []
     for symbol in SYMBOLS:
@@ -379,6 +474,8 @@ def process_job(dt, symbol, interval, data_folder, end_date, last_dt, downloader
 from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SYMBOLS_CACHE = os.path.join(BASE_DIR, ".symbols_cache.json")
+SYMBOLS_CACHE_TTL_HOURS = 24
 
 README_TEMPLATE = """# USDT-M Perpetual Futures (Binance)
 
@@ -433,7 +530,7 @@ def run_update(data_folder, end_date=None, budget=None, max_workers=None):
     if budget is None:
         budget = Budget(float(os.getenv("MAX_RUNTIME_MIN", "90")))
     if max_workers is None:
-        max_workers = int(os.getenv("FETCH_WORKERS", "8" if PROXY else "32"))
+        max_workers = int(os.getenv("FETCH_WORKERS", "8" if PROXY else "64"))
 
     index = load_index(data_folder)
     if not index:
@@ -510,6 +607,7 @@ def main():
     os.makedirs(data_folder, exist_ok=True)
 
     logger.info("Starting USDT-M perpetual futures update -> %s", dataset_slug)
+    resolve_symbols()
     run_update(data_folder)
 
     readme_path = os.path.join(data_folder, "README.md")

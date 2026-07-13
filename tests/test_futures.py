@@ -492,3 +492,79 @@ def test_run_update_updates_index(fut, tmp_path, monkeypatch):
     monkeypatch.setattr(fut, "process_job", fake_process)
     fut.run_update(str(tmp_path), end_date=_dt.date(2026, 7, 8), budget=fut.Budget(1000), max_workers=2)
     assert fut.load_index(str(tmp_path)).get("BTCUSDT_1d.csv") == "2026-07-08 00:00:00"
+
+
+# ---- dynamic symbol discovery ----
+
+def test_fallback_symbols_is_nonempty(fut):
+    assert len(fut.FALLBACK_SYMBOLS) >= 30
+    assert "BTCUSDT" in fut.FALLBACK_SYMBOLS
+    assert "ETHUSDT" in fut.FALLBACK_SYMBOLS
+
+
+def test_symbols_is_mutable_copy(fut):
+    assert fut.SYMBOLS == fut.FALLBACK_SYMBOLS
+    assert fut.SYMBOLS is not fut.FALLBACK_SYMBOLS  # independent list
+
+
+def test_resolve_symbols_updates_module_list(fut, monkeypatch, tmp_path):
+    monkeypatch.setattr(fut, "SYMBOLS_CACHE", str(tmp_path / ".symbols_cache.json"))
+    monkeypatch.setattr(fut, "fetch_usdt_perpetual_symbols", lambda: ["BTCUSDT", "ETHUSDT"])
+    fut.resolve_symbols()
+    assert fut.SYMBOLS == ["BTCUSDT", "ETHUSDT"]
+
+
+def test_fetch_symbols_returns_fallback_on_api_failure(fut, monkeypatch):
+    monkeypatch.setattr(fut.SESSION, "get", lambda url, timeout=15: (
+        (_ for _ in ()).throw(fut.requests.ConnectionError("offline"))))
+    # No cache -> fallback
+    monkeypatch.setattr(fut, "SYMBOLS_CACHE", "/nonexistent/cache.json")
+    symbols = fut.fetch_usdt_perpetual_symbols()
+    assert symbols == fut.FALLBACK_SYMBOLS
+
+
+def test_fetch_symbols_uses_cache_when_fresh(fut, tmp_path, monkeypatch):
+    cache = tmp_path / "cache.json"
+    cache.write_text('{"_fetched_at": 99999999999, "symbols": ["BTCUSDT", "ETHUSDT"]}')
+    monkeypatch.setattr(fut, "SYMBOLS_CACHE", str(cache))
+    # Must not call the API
+    called = {"n": 0}
+    monkeypatch.setattr(fut.SESSION, "get", lambda *a, **k: called.update({"n": called["n"] + 1}))
+    symbols = fut.fetch_usdt_perpetual_symbols()
+    assert symbols == ["BTCUSDT", "ETHUSDT"]
+    assert called["n"] == 0
+
+
+def test_fetch_symbols_filters_usdt_perpetual_trading(fut, monkeypatch):
+    class FakeResp:
+        status_code = 200
+        @staticmethod
+        def json():
+            return {"symbols": [
+                {"symbol": "BTCUSDT", "quoteAsset": "USDT", "contractType": "PERPETUAL", "status": "TRADING"},
+                {"symbol": "ETHUSDT", "quoteAsset": "USDT", "contractType": "PERPETUAL", "status": "TRADING"},
+                {"symbol": "BTCDOWNUSDT", "quoteAsset": "USDT", "contractType": "PERPETUAL", "status": "SETTLING"},
+                {"symbol": "BTCUSDT_210625", "quoteAsset": "USDT", "contractType": "CURRENT_QUARTER", "status": "TRADING"},
+                {"symbol": "BTCBUSD", "quoteAsset": "BUSD", "contractType": "PERPETUAL", "status": "TRADING"},
+            ]}
+        @staticmethod
+        def raise_for_status():
+            pass
+
+    monkeypatch.setattr(fut.SESSION, "get", lambda url, timeout=15: FakeResp)
+    monkeypatch.setattr(fut, "SYMBOLS_CACHE", "/nonexistent/cache2.json")
+    symbols = fut.fetch_usdt_perpetual_symbols()
+    assert symbols == ["BTCUSDT", "ETHUSDT"]
+
+
+def test_build_jobs_uses_current_symbols(fut, monkeypatch):
+    monkeypatch.setattr(fut, "SYMBOLS", ["BTCUSDT"])
+    monkeypatch.setattr(fut, "INTERVALS", ["1d", "1h"])
+    kl = _by_name(fut, "klines")
+    mp = _by_name(fut, "markPrice")
+    monkeypatch.setattr(fut, "DATA_TYPES", [kl, mp])
+    jobs = fut.build_jobs()
+    # 1 symbol × 2 types × 2 intervals = 4
+    assert len(jobs) == 4
+    symbols_seen = {j.symbol for j in jobs}
+    assert symbols_seen == {"BTCUSDT"}

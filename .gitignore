@@ -176,6 +176,7 @@ cython_debug/
 data
 merged_data
 new_data
+.symbols_cache.json
 .DS_Store
 *.DS_Store
 *.ipynb
