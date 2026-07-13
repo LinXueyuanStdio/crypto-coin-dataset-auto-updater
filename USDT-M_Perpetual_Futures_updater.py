@@ -477,13 +477,27 @@ def build_index_from_files(data_folder):
 def process_job(dt, symbol, interval, data_folder, end_date, last_dt, downloader=download_series_file):
     out_name = output_filename(dt, symbol, interval)
     data_path = os.path.join(data_folder, out_name)
-    new_df = fetch_series(dt, symbol, interval, last_dt, end_date, downloader=downloader)
+    label = out_name.replace(".csv", "")
+    t0 = time.monotonic()
+    logger.info("[%s] fetching ...", label)
+    try:
+        new_df = fetch_series(dt, symbol, interval, last_dt, end_date, downloader=downloader)
+    except Exception:
+        elapsed = time.monotonic() - t0
+        logger.error("[%s] FAILED (%.1fs)", label, elapsed)
+        raise
     if new_df is None or new_df.empty:
+        elapsed = time.monotonic() - t0
+        logger.info("[%s] no new data (%.1fs)", label, elapsed)
         return None
     existing_df = pd.read_csv(data_path, dtype=str) if os.path.exists(data_path) else None
     merged = merge_frames(existing_df, new_df, dt.time_col)
     merged.to_csv(data_path, index=False)
     new_last = pd.to_datetime(merged[dt.time_col], errors="coerce").max()
+    elapsed = time.monotonic() - t0
+    rows = len(merged)
+    ts = new_last.strftime("%Y-%m-%d") if new_last is not pd.NaT else "?"
+    logger.info("[%s] done — %d rows through %s (%.1fs)", label, rows, ts, elapsed)
     return data_path, (None if pd.isna(new_last) else new_last.to_pydatetime())
 
 
@@ -566,7 +580,11 @@ def run_update(data_folder, end_date=None, budget=None, max_workers=None):
 
     jobs = iter(pending)
     produced = 0
+    failed = 0
     inflight = {}  # future -> output filename
+    total_pending = len(pending)
+    last_log_at = time.monotonic()
+    PROGRESS_LOG_EVERY_S = 60  # emit a progress line at most every N seconds
 
     def submit_next(ex):
         try:
@@ -593,7 +611,18 @@ def run_update(data_folder, end_date=None, budget=None, max_workers=None):
                             index[filename] = new_last.strftime("%Y-%m-%d %H:%M:%S")
                         produced += 1
                 except Exception as e:
+                    failed += 1
                     logger.warning("series failed: %s", e)
+            now = time.monotonic()
+            if now - last_log_at >= PROGRESS_LOG_EVERY_S:
+                done_so_far = produced + failed
+                pct = done_so_far * 100.0 / total_pending if total_pending else 0
+                rate = done_so_far / max((now - last_log_at), 1)
+                logger.info(
+                    "progress: %d/%d (%.1f%%) ok=%d fail=%d — %.1f series/s",
+                    done_so_far, total_pending, pct, produced, failed, rate,
+                )
+                last_log_at = now
             if not budget.exceeded():
                 for _ in range(len(done)):
                     if not submit_next(ex):

@@ -16,13 +16,26 @@ set -euo pipefail
 PUSH_INTERVAL_SEC="${PUSH_INTERVAL_SEC:-1800}"
 DATA_DIR="${DATA_DIR:-data}"
 UPDATER_SCRIPT="USDT-M_Perpetual_Futures_updater.py"
+OUTPUT_DIR="${OUTPUT_DIR:-output}"
+LOG_FILE="${LOG_FILE:-${OUTPUT_DIR}/futures_update.log}"
+
+# Force UTF-8 everywhere — avoids mojibake in the log file on Windows.
+export PYTHONIOENCODING=utf-8
+export LANG=en_US.UTF-8
+export LC_ALL=en_US.UTF-8
 
 # ---- helpers ---------------------------------------------------------------
+mkdir -p "$OUTPUT_DIR"
+
+# Tee all output (stdout+stderr) to both terminal and the log file.
+exec > >(tee -a "$LOG_FILE") 2>&1
+
 log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"; }
 
 push_progress() {
     log ">>> Auto-pushing progress to HF …"
-    if ! git -C "$DATA_DIR" diff --quiet || ! git -C "$DATA_DIR" diff --cached --quiet; then
+    # git diff only covers tracked files; status --porcelain catches new files too.
+    if [ -n "$(git -C "$DATA_DIR" status --porcelain)" ]; then
         git -C "$DATA_DIR" add -A
         git -C "$DATA_DIR" commit -m "auto-save $(date -u +%Y-%m-%dT%H:%M:%SZ)" || true
         git -C "$DATA_DIR" push origin main 2>&1 || log "WARNING: push failed (will retry later)"
