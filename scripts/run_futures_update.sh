@@ -13,7 +13,7 @@
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
-PUSH_INTERVAL_SEC="${PUSH_INTERVAL_SEC:-600}"
+PUSH_INTERVAL_SEC="${PUSH_INTERVAL_SEC:-180}"
 DATA_DIR="${DATA_DIR:-data}"
 UPDATER_SCRIPT="USDT-M_Perpetual_Futures_updater.py"
 OUTPUT_DIR="${OUTPUT_DIR:-output}"
