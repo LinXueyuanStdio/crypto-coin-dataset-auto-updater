@@ -11,6 +11,7 @@ from datetime import date, datetime, timedelta, timezone
 import requests
 from requests.adapters import HTTPAdapter
 import pandas as pd
+from dotenv import load_dotenv
 from huggingface_hub import HfApi
 
 # ----- logging (handlers attached lazily in __main__ to keep import side-effect-free) -----
@@ -647,6 +648,7 @@ def upload(upload_folder, dataset_slug, version_notes):
 
 
 def main():
+    load_dotenv()
     configure_proxy()
     dataset_slug = os.getenv("DATASET_SLUG", "linxy/USDT-M_Perpetual_Futures")
     data_folder = os.path.join(BASE_DIR, os.getenv("DATA_DIR", "data"))
@@ -660,16 +662,19 @@ def main():
     ensure_readme(readme_path)
     stamp_readme(readme_path)
 
-    notes = datetime.now(timezone.utc).strftime("Updated at %B %d %Y %H:%M:%S UTC")
-    for attempt in range(1, 11):
-        try:
-            upload(data_folder, dataset_slug, notes)
-            break
-        except Exception as e:
-            logger.error("Upload attempt %d/10 failed: %s. Retrying in 60s...", attempt, e)
-            time.sleep(60)
+    if not os.getenv("HF_TOKEN"):
+        logger.warning("HF_TOKEN not set — skipping upload (local dev run)")
     else:
-        raise RuntimeError("Upload failed after 10 attempts")
+        notes = datetime.now(timezone.utc).strftime("Updated at %B %d %Y %H:%M:%S UTC")
+        for attempt in range(1, 11):
+            try:
+                upload(data_folder, dataset_slug, notes)
+                break
+            except Exception as e:
+                logger.error("Upload attempt %d/10 failed: %s. Retrying in 60s...", attempt, e)
+                time.sleep(60)
+        else:
+            raise RuntimeError("Upload failed after 10 attempts")
 
 
 if __name__ == "__main__":
