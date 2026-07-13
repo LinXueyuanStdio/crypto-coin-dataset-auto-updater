@@ -37,6 +37,12 @@ log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"; }
 
 push_progress() {
     log ">>> Auto-pushing progress to HF …"
+    # Only push if data/ is its own git repo (cloned from HF in CI).
+    # Locally data/ is a plain directory — skip git push.
+    if [ ! -d "$DATA_DIR/.git" ]; then
+        log "data/ is not a git repo — skipping push (local dev)"
+        return
+    fi
     # git diff only covers tracked files; status --porcelain catches new files too.
     if [ -n "$(git -C "$DATA_DIR" status --porcelain)" ]; then
         git -C "$DATA_DIR" add -A
