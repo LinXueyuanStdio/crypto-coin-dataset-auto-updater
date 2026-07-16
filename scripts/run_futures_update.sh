@@ -215,7 +215,7 @@ trap cleanup SIGTERM SIGINT SIGHUP
 # ---- main ------------------------------------------------------------------
 log "=== Starting futures updater wrapper ==="
 log "Push interval: ${PUSH_INTERVAL_SEC}s  |  Data dir: $DATA_DIR"
-log "Batch: ${BATCH_INDEX:-0}/${BATCH_TOTAL:-1}  |  Workers: ${FETCH_WORKERS:-64}"
+log "Batch: $((BATCH_INDEX+1))/${BATCH_TOTAL:-1} (index=${BATCH_INDEX:-0})  |  Workers: ${FETCH_WORKERS:-64}"
 
 # Ensure git user is configured for auto-push commits.
 if ! git -C "$DATA_DIR" config user.email >/dev/null 2>&1; then
