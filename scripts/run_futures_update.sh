@@ -81,16 +81,25 @@ merge_safe_pull() {
 #   committing, so the HF repo doesn't accumulate giant blobs.
 # ---------------------------------------------------------------------------
 lfs_ensure() {
-    git -C "$DATA_DIR" lfs install 2>/dev/null || true
+    git -C "$DATA_DIR" lfs install >/dev/null 2>&1 || true
 
     # Preemptively LFS-track patterns that always grow large.
-    git -C "$DATA_DIR" lfs track '*_5m.csv' '*_15m.csv' '*_30m.csv' '*_metrics.csv' 2>/dev/null || true
+    # Redirect stdout too — "already supported" prints to stdout, not stderr.
+    git -C "$DATA_DIR" lfs track '*_5m.csv' '*_15m.csv' '*_30m.csv' '*_metrics.csv' >/dev/null 2>&1 || true
 
-    # Catch any remaining CSV ≥ 9 MiB that didn't match the patterns.
-    large=$(find "$DATA_DIR" -name '*.csv' -size +9M -printf '%P\n' 2>/dev/null || true)
+    # Catch any remaining CSV ≥ 9 MiB that didn't match the wildcard patterns
+    # above. Exclude files already covered by *_5m.csv, *_15m.csv, *_30m.csv,
+    # and *_metrics.csv to avoid redundant per-file "git lfs track" calls
+    # (which would just print "already supported").
+    large=$(find "$DATA_DIR" -name '*.csv' -size +9M \
+        ! -name '*_5m.csv' \
+        ! -name '*_15m.csv' \
+        ! -name '*_30m.csv' \
+        ! -name '*_metrics.csv' \
+        -printf '%P\n' 2>/dev/null || true)
     if [ -n "$large" ]; then
         echo "$large" | while IFS= read -r f; do
-            git -C "$DATA_DIR" lfs track "$f" 2>/dev/null || true
+            git -C "$DATA_DIR" lfs track "$f" >/dev/null 2>&1 || true
         done
         log "LFS-tracked $(echo "$large" | wc -l) extra file(s) ≥9 MiB"
     fi
