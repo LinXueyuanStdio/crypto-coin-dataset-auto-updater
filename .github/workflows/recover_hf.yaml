@@ -9,7 +9,7 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          git clone --depth 2 "https://hf_user:${HF_TOKEN}@huggingface.co/datasets/linxy/USDT-M_Perpetual_Futures" data
+          git clone "https://hf_user:${HF_TOKEN}@huggingface.co/datasets/linxy/USDT-M_Perpetual_Futures" data
           cd data
           echo "Before: $(git log --oneline -3)"
           git reset --hard HEAD~1
