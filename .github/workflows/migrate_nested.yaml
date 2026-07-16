@@ -23,23 +23,16 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Clone dataset repository
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: |
-          for attempt in 1 2 3; do
-            echo "Clone attempt $attempt/3 …"
-            if git clone --depth 1 \
-              "https://hf_user:${HF_TOKEN}@huggingface.co/datasets/${{ inputs.dataset_slug }}" \
-              data 2>&1; then
-              echo "✅ Clone OK"
-              break
-            fi
-            echo "Clone failed, waiting $((attempt * 30))s…"
-            rm -rf data
-            sleep $((attempt * 30))
-          done
-          [ -d data ] || { echo "❌ Clone failed"; exit 1; }
+      # ------------------------------------------------------------------
+      # Cache-aware clone using .git cache (saves ~8 min on retries)
+      # ------------------------------------------------------------------
+      - name: Setup dataset repo
+        id: dataset-repo
+        uses: ./.github/actions/hf-repo-setup
+        with:
+          hf_token: ${{ secrets.HF_TOKEN }}
+          repo_slug: ${{ inputs.dataset_slug }}
+          data_dir: data
 
       - name: Install dependencies for migration
         run: pip install pandas pyarrow
@@ -149,3 +142,15 @@ jobs:
           print(f'Commit created — {len(ops)} operations')
           " 2>&1
           echo "=== Migration complete ==="
+
+      # ------------------------------------------------------------------
+      # Save caches so retries skip the clone
+      # ------------------------------------------------------------------
+      - name: Save caches
+        if: always() && steps.dataset-repo.outcome == 'success'
+        uses: ./.github/actions/hf-repo-setup
+        with:
+          mode: save
+          hf_token: ${{ secrets.HF_TOKEN }}
+          repo_slug: ${{ inputs.dataset_slug }}
+          data_dir: data
