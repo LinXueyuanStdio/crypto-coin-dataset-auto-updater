@@ -24,27 +24,56 @@ jobs:
           python-version: "3.10"
 
       # ------------------------------------------------------------------
-      # Cache-aware clone using .git cache (saves ~8 min on retries)
+      # Clone + undo any broken rescue commits
       # ------------------------------------------------------------------
-      - name: Setup dataset repo
-        id: dataset-repo
-        uses: ./.github/actions/hf-repo-setup
-        with:
-          hf_token: ${{ secrets.HF_TOKEN }}
-          repo_slug: ${{ inputs.dataset_slug }}
-          data_dir: data
+      - name: Clone dataset and undo rescue commits
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          set -e
+          URL="https://hf_user:${HF_TOKEN}@huggingface.co/datasets/${{ inputs.dataset_slug }}"
 
-      - name: Install dependencies for migration
+          for attempt in 1 2 3; do
+            echo "Clone attempt $attempt/3 …"
+            if git clone "$URL" data 2>&1; then
+              echo "✅ Clone OK"
+              break
+            fi
+            echo "Failed, waiting $((attempt * 30))s…"
+            rm -rf data
+            sleep $((attempt * 30))
+          done
+          [ -d data ] || { echo "❌ Clone failed"; exit 1; }
+
+          cd data
+          git config user.email "migration-bot[bot]@users.noreply.github.com"
+          git config user.name "migration-bot[bot]"
+
+          # Undo any rescue commits (empty working-tree pushes)
+          CURRENT=$(git log --oneline -1)
+          if echo "$CURRENT" | grep -q "rescue"; then
+            echo "Found rescue commit: $CURRENT"
+            echo "Resetting to HEAD~1 …"
+            git reset --hard HEAD~1
+            git push origin main --force
+            echo "✅ Rescue commit undone"
+          else
+            echo "Latest commit is NOT a rescue — proceeding"
+            echo "  $CURRENT"
+          fi
+
+      - name: Install dependencies
         run: pip install pandas pyarrow huggingface_hub
 
-      - name: Migrate symbols one-by-one (resumable)
+      # ------------------------------------------------------------------
+      # Per-symbol migration (resumable — checks remote for remaining work)
+      # ------------------------------------------------------------------
+      - name: Migrate symbols one-by-one
         working-directory: data
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           set -e
-          git config user.email "migration-bot[bot]@users.noreply.github.com"
-          git config user.name "migration-bot[bot]"
 
           python3 -c "
           import os, sys, json
@@ -110,7 +139,6 @@ jobs:
                   )
               except Exception as e:
                   print(f'  ERROR committing {sym}: {e}')
-                  # Rollback local changes for retry
                   if os.path.isdir(sym):
                       for f in os.listdir(sym):
                           fp = os.path.join(sym, f)
@@ -119,7 +147,7 @@ jobs:
                       os.rmdir(sym) if not os.listdir(sym) else None
                   raise
 
-              # Sync local git with remote (so .git cache is fresh)
+              # Sync local git with remote
               os.system('git fetch origin main --quiet')
               os.system('git reset --hard origin/main')
               print(f'  ✅ {sym} done')
@@ -141,15 +169,3 @@ jobs:
               print(f'Updated {len(new_idx)} _index.json entries')
           " 2>&1
           echo "=== Migration complete ==="
-
-      # ------------------------------------------------------------------
-      # Save caches so retries skip the clone
-      # ------------------------------------------------------------------
-      - name: Save caches
-        if: always() && steps.dataset-repo.outcome == 'success'
-        uses: ./.github/actions/hf-repo-setup
-        with:
-          mode: save
-          hf_token: ${{ secrets.HF_TOKEN }}
-          repo_slug: ${{ inputs.dataset_slug }}
-          data_dir: data
