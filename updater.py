@@ -359,7 +359,9 @@ def main():
         return True, new_file
 
     logger.info("Fetching new data from Binance...")
-    element_mapping(jobs, f, thread_pool_size=multiprocessing.cpu_count())
+    fetch_workers = int(os.getenv("FETCH_WORKERS", str(multiprocessing.cpu_count())))
+    logger.info("Using %d fetch workers", fetch_workers)
+    element_mapping(jobs, f, thread_pool_size=fetch_workers)
 
     # Step 4: Merge new data with old datasets and save the merged files in MERGED_FOLDER
     logger.info("Merging datasets...")
