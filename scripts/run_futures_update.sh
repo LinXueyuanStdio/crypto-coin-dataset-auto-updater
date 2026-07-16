@@ -59,8 +59,8 @@ merge_safe_pull() {
     git -C "$DATA_DIR" stash --include-untracked 2>/dev/null || true
     git -C "$DATA_DIR" fetch origin main --quiet
     git -C "$DATA_DIR" reset --hard origin/main
-    if git -C "$DATA_DIR" stash pop 2>/dev/null; then
-        log "Stash popped cleanly"
+    if git -C "$DATA_DIR" stash pop --index 2>/dev/null; then
+        log "Stash popped cleanly (index restored)"
     else
         log "Stash pop had conflicts (files preserved — updater will reconcile)"
         git -C "$DATA_DIR" checkout --theirs . 2>/dev/null || true
@@ -122,8 +122,11 @@ push_progress() {
         return 0
     fi
 
-    # 3. Sync with remote (stash → fetch → reset → pop — handles dirty tree)
+    # 3. Sync with remote (stash → fetch → reset → pop --index)
     merge_safe_pull
+
+    # Re-stage in case stash pop --index failed and files became unstaged
+    git -C "$DATA_DIR" add -A 2>/dev/null || true
 
     # 4. Commit
     local commit_msg="auto-save $(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -172,8 +175,10 @@ push_with_retry() {
             git -C "$DATA_DIR" stash --include-untracked
             git -C "$DATA_DIR" fetch origin main --quiet
             git -C "$DATA_DIR" reset --hard origin/main
-            if git -C "$DATA_DIR" stash pop 2>/dev/null; then
-                log "Stash popped cleanly"
+            if git -C "$DATA_DIR" stash pop --index 2>/dev/null; then
+                log "Stash popped cleanly (index restored)"
+            elif git -C "$DATA_DIR" stash pop 2>/dev/null; then
+                log "Stash popped (index lost)"
             else
                 log "Stash pop had conflicts — keeping our version"
                 git -C "$DATA_DIR" checkout --theirs . 2>/dev/null || true
