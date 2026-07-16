@@ -12,7 +12,7 @@ on:
 jobs:
   migrate:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 360
 
     steps:
       - name: Check out repository
@@ -37,110 +37,107 @@ jobs:
       - name: Install dependencies for migration
         run: pip install pandas pyarrow huggingface_hub
 
-      - name: Reorganize + convert to Parquet
+      - name: Migrate symbols one-by-one (resumable)
         working-directory: data
         env:
-          DATASET_SLUG: ${{ inputs.dataset_slug }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           set -e
           git config user.email "migration-bot[bot]@users.noreply.github.com"
           git config user.name "migration-bot[bot]"
 
-          echo "=== Step 1: Reorganize CSV files into per-symbol folders ==="
-          moved=0
-          for csv in *.csv; do
-            [ -f "$csv" ] || continue
-            case "$csv" in
-              .*|README.md|meta.json|.gitattributes|.gitignore) continue ;;
-            esac
-            symbol="${csv%%_*}"
-            mkdir -p "$symbol"
-            git mv "$csv" "$symbol/$csv" || mv "$csv" "$symbol/$csv"
-            moved=$((moved + 1))
-          done
-          echo "Moved $moved CSV files into per-symbol folders"
-
-          echo "=== Step 2: Convert CSVs to Parquet and delete CSVs ==="
           python3 -c "
-          import os, sys, pandas as pd
-          total = sum(1 for _, _, fs in os.walk('.') for f in fs if f.endswith('.csv'))
-          done = 0
-          for root, dirs, files in os.walk('.'):
-              for f in files:
-                  if not f.endswith('.csv'):
+          import os, sys, json
+          from collections import defaultdict
+          import pandas as pd
+          from huggingface_hub import HfApi, CommitOperationAdd, CommitOperationDelete
+
+          api = HfApi(token=os.environ['HF_TOKEN'])
+          repo = 'linxy/USDT-M_Perpetual_Futures'
+
+          # ---- find symbols that still need migration ----
+          files = api.list_repo_files(repo, repo_type='dataset')
+          flat_csvs = [f for f in files if f.endswith('.csv') and '/' not in f]
+          by_symbol = defaultdict(list)
+          for f in flat_csvs:
+              symbol = f.split('_')[0]
+              by_symbol[symbol].append(f)
+
+          if not by_symbol:
+              print('All symbols already migrated — nothing to do')
+              sys.exit(0)
+
+          symbols = sorted(by_symbol)
+          print(f'{len(symbols)} symbol(s) to migrate: {symbols}')
+
+          # ---- process each symbol ----
+          for sym in symbols:
+              csvs = by_symbol[sym]
+              print(f'\n>>> {sym} ({len(csvs)} files)')
+
+              # Reorganize: move CSV files into {sym}/ folder
+              os.makedirs(sym, exist_ok=True)
+              for csv in csvs:
+                  if os.path.exists(csv):
+                      os.rename(csv, os.path.join(sym, csv))
+
+              # Convert CSV → Parquet, delete CSV
+              for csv in csvs:
+                  csv_path = os.path.join(sym, csv)
+                  if not os.path.exists(csv_path):
                       continue
-                  csv_path = os.path.join(root, f)
                   pq_path = csv_path[:-4] + '.parquet'
                   df = pd.read_csv(csv_path, dtype=str)
                   df.to_parquet(pq_path, index=False, compression='zstd')
                   os.remove(csv_path)
-                  done += 1
-                  if done % 50 == 0 or done == total:
-                      print(f'  [{done}/{total}] converted', flush=True)
-          print(f'Completed: {done}/{total} files')
-          " 2>&1
 
-          echo "=== Step 3: Update _index.json keys ==="
-          if [ -f _index.json ]; then
-            python3 -c "
-          import json
-          with open('_index.json') as f:
-              idx = json.load(f)
-          new_idx = {}
-          for old_key, ts in idx.items():
-              symbol = old_key.split('_')[0]
-              # Add folder prefix + change extension
-              name = old_key.replace('.csv', '.parquet')
-              new_key = f'{symbol}/{name}'
-              new_idx[new_key] = ts
-          with open('_index.json', 'w') as f:
-              json.dump(new_idx, f, indent=0, sort_keys=True)
-          print(f'Updated {len(new_idx)} index entries')
-          " || echo "(no _index.json — will be built from parquet files)"
-          fi
+              # Build commit: delete old flat CSVs + add new parquets
+              ops = []
+              for csv in csvs:
+                  ops.append(CommitOperationDelete(path_in_repo=csv))
+              for f in sorted(os.listdir(sym)):
+                  fp = os.path.join(sym, f)
+                  ops.append(CommitOperationAdd(path_in_repo=fp, path_or_fileobj=fp))
 
-          echo "=== Step 4: Upload via huggingface_hub create_commit ==="
-          # Use create_commit to batch all file operations into ONE API call,
-          # avoiding the per-file LFS rate limit that `git push` triggers.
-          python3 -c "
-          import os, sys
-          from huggingface_hub import HfApi, CommitOperationAdd, CommitOperationDelete
+              print(f'  Committing {len(ops)} operations …')
+              try:
+                  api.create_commit(
+                      repo_id=repo,
+                      repo_type='dataset',
+                      commit_message=f'migrate: {sym} → {sym}/',
+                      operations=ops,
+                  )
+              except Exception as e:
+                  print(f'  ERROR committing {sym}: {e}')
+                  # Rollback local changes for retry
+                  if os.path.isdir(sym):
+                      for f in os.listdir(sym):
+                          fp = os.path.join(sym, f)
+                          if os.path.isfile(fp):
+                              os.rename(fp, f) if not os.path.exists(f) else None
+                      os.rmdir(sym) if not os.listdir(sym) else None
+                  raise
 
-          api = HfApi(token=os.environ['HF_TOKEN'])
-          repo = os.environ['DATASET_SLUG']
-          ops = []
+              # Sync local git with remote (so .git cache is fresh)
+              os.system('git fetch origin main --quiet')
+              os.system('git reset --hard origin/main')
+              print(f'  ✅ {sym} done')
 
-          # (a) Delete old flat CSV files from repo root
-          try:
-              files = api.list_repo_files(repo, repo_type='dataset')
-              old_csvs = [f for f in files if f.endswith('.csv') and '/' not in f]
-              print(f'Deleting {len(old_csvs)} old flat CSV files …')
-              for f in old_csvs:
-                  ops.append(CommitOperationDelete(path_in_repo=f))
-          except Exception as e:
-              print(f'Could not list remote files: {e}')
+          print(f'\n=== {len(symbols)} symbols migrated ===')
 
-          # (b) Add new Parquet files and metadata
-          for root, dirs, files in os.walk('.'):
-              # skip .git
-              if '.git' in root.split(os.sep):
-                  continue
-              for f in files:
-                  if f in ('.git', '.gitignore', '.gitattributes'):
-                      continue
-                  path = os.path.join(root, f).lstrip('./')
-                  ops.append(CommitOperationAdd(path_in_repo=path, path_or_fileobj=path))
-
-          print(f'Creating commit with {len(ops)} operations …')
-          api.create_commit(
-              repo_id=repo,
-              repo_type='dataset',
-              commit_message='migrate: per-symbol folders + Parquet format',
-              commit_description='Reorganised into {symbol}/{symbol}_suffix.parquet layout; CSV converted to Parquet (zstd)',
-              operations=ops,
-          )
-          print(f'Commit created — {len(ops)} operations')
+          # ---- final: update _index.json ----
+          if os.path.exists('_index.json'):
+              with open('_index.json') as f:
+                  idx = json.load(f)
+              new_idx = {}
+              for old_key, ts in idx.items():
+                  symbol = old_key.split('_')[0]
+                  name = old_key.replace('.csv', '.parquet')
+                  new_key = f'{symbol}/{name}'
+                  new_idx[new_key] = ts
+              with open('_index.json', 'w') as f:
+                  json.dump(new_idx, f, indent=0, sort_keys=True)
+              print(f'Updated {len(new_idx)} _index.json entries')
           " 2>&1
           echo "=== Migration complete ==="
 
