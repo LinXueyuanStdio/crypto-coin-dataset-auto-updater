@@ -95,9 +95,10 @@ runs:
           for attempt in 1 2 3; do
             echo "Clone $strategy/$attempt …"
             [ "$strategy" = "shallow" ] && depth="--depth 1" || depth=""
-            if git clone $depth "https://hf_user:${{ inputs.hf_token }}@huggingface.co/datasets/${{ inputs.repo_slug }}" "${{ inputs.data_dir }}" 2>&1; then
-              cd "${{ inputs.data_dir }}" && git lfs pull 2>/dev/null || true
-              echo "✅ Clone OK ($strategy) — $(cd "${{ inputs.data_dir }}" && git rev-parse --short HEAD)"
+            URL="https://hf_user:${{ inputs.hf_token }}@huggingface.co/datasets/${{ inputs.repo_slug }}"
+            if git clone $depth "$URL" "${{ inputs.data_dir }}" 2>&1; then
+              (cd "${{ inputs.data_dir }}" && git lfs pull 2>/dev/null) || true
+              echo "✅ Clone OK ($strategy) — $(git -C "${{ inputs.data_dir }}" rev-parse --short HEAD)"
               echo "::endgroup::"
               exit 0
             fi
