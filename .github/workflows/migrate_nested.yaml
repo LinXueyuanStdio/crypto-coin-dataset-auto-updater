@@ -1,0 +1,115 @@
+name: Migrate to Nested Per-Symbol Structure
+
+on:
+  workflow_dispatch:
+    inputs:
+      dataset_slug:
+        description: 'HF dataset slug to migrate'
+        required: true
+        default: 'linxy/USDT-M_Perpetual_Futures'
+        type: string
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Clone dataset repository
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          for attempt in 1 2 3; do
+            echo "Clone attempt $attempt/3 …"
+            if git clone --depth 1 \
+              "https://hf_user:${HF_TOKEN}@huggingface.co/datasets/${{ inputs.dataset_slug }}" \
+              data 2>&1; then
+              echo "✅ Clone OK"
+              break
+            fi
+            echo "Clone failed, waiting $((attempt * 30))s…"
+            rm -rf data
+            sleep $((attempt * 30))
+          done
+          [ -d data ] || { echo "❌ Clone failed"; exit 1; }
+
+      - name: Install dependencies for migration
+        run: pip install pandas pyarrow
+
+      - name: Reorganize + convert to Parquet
+        working-directory: data
+        env:
+          DATASET_SLUG: ${{ inputs.dataset_slug }}
+        run: |
+          set -e
+          git config user.email "migration-bot[bot]@users.noreply.github.com"
+          git config user.name "migration-bot[bot]"
+
+          echo "=== Step 1: Reorganize CSV files into per-symbol folders ==="
+          moved=0
+          for csv in *.csv; do
+            [ -f "$csv" ] || continue
+            case "$csv" in
+              .*|README.md|meta.json|.gitattributes|.gitignore) continue ;;
+            esac
+            symbol="${csv%%_*}"
+            mkdir -p "$symbol"
+            git mv "$csv" "$symbol/$csv" || mv "$csv" "$symbol/$csv"
+            moved=$((moved + 1))
+          done
+          echo "Moved $moved CSV files into per-symbol folders"
+
+          echo "=== Step 2: Convert CSVs to Parquet and delete CSVs ==="
+          converted=0
+          python3 -c "
+          import os, pandas as pd
+          for root, dirs, files in os.walk('.'):
+              for f in files:
+                  if not f.endswith('.csv'):
+                      continue
+                  csv_path = os.path.join(root, f)
+                  pq_path = csv_path[:-4] + '.parquet'
+                  print(f'  {csv_path} → {pq_path}')
+                  df = pd.read_csv(csv_path, dtype=str)
+                  df.to_parquet(pq_path, index=False, compression='zstd')
+                  os.remove(csv_path)
+          " 2>&1 | tail -5
+          echo "Conversion done"
+
+          echo "=== Step 3: Update _index.json keys ==="
+          if [ -f _index.json ]; then
+            python3 -c "
+          import json
+          with open('_index.json') as f:
+              idx = json.load(f)
+          new_idx = {}
+          for old_key, ts in idx.items():
+              symbol = old_key.split('_')[0]
+              # Add folder prefix + change extension
+              name = old_key.replace('.csv', '.parquet')
+              new_key = f'{symbol}/{name}'
+              new_idx[new_key] = ts
+          with open('_index.json', 'w') as f:
+              json.dump(new_idx, f, indent=0, sort_keys=True)
+          print(f'Updated {len(new_idx)} index entries')
+          " || echo "(no _index.json — will be built from parquet files)"
+          fi
+
+          echo "=== Step 4: Commit + push ==="
+          git add -A
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "No changes — already migrated"
+            exit 0
+          fi
+          git commit -m "migrate: per-symbol folders + Parquet format ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
+          BRANCH=$(git rev-parse --abbrev-ref HEAD)
+          git push origin "$BRANCH" --force
+          echo "=== Migration complete ==="

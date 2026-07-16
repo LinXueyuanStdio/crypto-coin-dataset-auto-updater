@@ -30,10 +30,10 @@ def test_output_filename(fut):
     mp = next(dt for dt in fut.DATA_TYPES if dt.name == "markPrice")
     me = next(dt for dt in fut.DATA_TYPES if dt.name == "metrics")
     fr = next(dt for dt in fut.DATA_TYPES if dt.name == "fundingRate")
-    assert fut.output_filename(kl, "BTCUSDT", "1d") == "BTCUSDT_1d.csv"
-    assert fut.output_filename(mp, "BTCUSDT", "1h") == "BTCUSDT_markPrice_1h.csv"
-    assert fut.output_filename(me, "BTCUSDT", None) == "BTCUSDT_metrics.csv"
-    assert fut.output_filename(fr, "ETHUSDT", None) == "ETHUSDT_fundingRate.csv"
+    assert fut.output_filename(kl, "BTCUSDT", "1d") == "BTCUSDT/BTCUSDT_1d.parquet"
+    assert fut.output_filename(mp, "BTCUSDT", "1h") == "BTCUSDT/BTCUSDT_markPrice_1h.parquet"
+    assert fut.output_filename(me, "BTCUSDT", None) == "BTCUSDT/BTCUSDT_metrics.parquet"
+    assert fut.output_filename(fr, "ETHUSDT", None) == "ETHUSDT/ETHUSDT_fundingRate.parquet"
 
 
 def test_symbols_and_intervals(fut):
@@ -303,7 +303,7 @@ def test_process_job_writes_then_resumes(fut, tmp_path, monkeypatch):
 
     monkeypatch.setattr(fut, "fetch_series", fetch_first)
     path, new_last = fut.process_job(kl, "BTCUSDT", "1d", str(tmp_path), _dt.date(2026, 7, 2), None)
-    assert path is not None and pd.read_csv(path).shape[0] == 2
+    assert path is not None and pd.read_parquet(path).shape[0] == 2
     assert new_last.day == 2
 
     # second run: last stored is 2026-07-02 -> fetch returns overlap + 1 new
@@ -316,7 +316,7 @@ def test_process_job_writes_then_resumes(fut, tmp_path, monkeypatch):
 
     monkeypatch.setattr(fut, "fetch_series", fetch_second)
     _, new_last2 = fut.process_job(kl, "BTCUSDT", "1d", str(tmp_path), _dt.date(2026, 7, 3), _dt.datetime(2026, 7, 2))
-    df = pd.read_csv(path)
+    df = pd.read_parquet(path)
     assert df.shape[0] == 3  # deduped 2026-07-02
     assert new_last2.day == 3
 
@@ -427,8 +427,8 @@ def test_process_job_preserves_value_text_across_merge(fut, tmp_path, monkeypatc
 
     monkeypatch.setattr(fut, "fetch_series", fetch2)
     fut.process_job(kl, "BTCUSDT", "1d", str(tmp_path), _dt.date(2026, 7, 2), _dt.datetime(2026, 7, 1))
-    text = open(p, encoding="utf-8").read()
-    assert "1.50000000" in text   # original text survives re-read + merge (not reformatted to 1.5)
+    df = pd.read_parquet(p)
+    assert df["open"].iloc[0] == "1.50000000"  # original value survives re-read + merge
 
 
 def test_index_save_load_roundtrip(fut, tmp_path):
@@ -462,9 +462,10 @@ def test_build_index_from_files(fut, tmp_path, monkeypatch):
     monkeypatch.setattr(fut, "SYMBOLS", ["BTCUSDT"])
     monkeypatch.setattr(fut, "DATA_TYPES", [kl])
     monkeypatch.setattr(fut, "INTERVALS", ["1d"])
+    # flat CSV file (legacy layout) — build_index_from_files finds it via fallback
     (tmp_path / "BTCUSDT_1d.csv").write_text("open_time,open\n2026-07-01 00:00:00,1\n2026-07-05 00:00:00,2\n")
     idx = fut.build_index_from_files(str(tmp_path))
-    assert idx == {"BTCUSDT_1d.csv": "2026-07-05 00:00:00"}
+    assert idx == {"BTCUSDT/BTCUSDT_1d.parquet": "2026-07-05 00:00:00"}
 
 
 def test_run_update_skips_up_to_date_via_index(fut, tmp_path, monkeypatch):
@@ -472,7 +473,7 @@ def test_run_update_skips_up_to_date_via_index(fut, tmp_path, monkeypatch):
     monkeypatch.setattr(fut, "SYMBOLS", ["BTCUSDT"])
     monkeypatch.setattr(fut, "DATA_TYPES", [kl])
     monkeypatch.setattr(fut, "INTERVALS", ["1d"])
-    fut.save_index(str(tmp_path), {"BTCUSDT_1d.csv": "2026-07-08 00:00:00"})
+    fut.save_index(str(tmp_path), {"BTCUSDT/BTCUSDT_1d.parquet": "2026-07-08 00:00:00"})
     monkeypatch.setattr(fut, "process_job",
                         lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not run for up-to-date file")))
     n = fut.run_update(str(tmp_path), end_date=_dt.date(2026, 7, 8), budget=fut.Budget(1000), max_workers=2)
@@ -491,7 +492,7 @@ def test_run_update_updates_index(fut, tmp_path, monkeypatch):
 
     monkeypatch.setattr(fut, "process_job", fake_process)
     fut.run_update(str(tmp_path), end_date=_dt.date(2026, 7, 8), budget=fut.Budget(1000), max_workers=2)
-    assert fut.load_index(str(tmp_path)).get("BTCUSDT_1d.csv") == "2026-07-08 00:00:00"
+    assert fut.load_index(str(tmp_path)).get("BTCUSDT/BTCUSDT_1d.parquet") == "2026-07-08 00:00:00"
 
 
 # ---- dynamic symbol discovery ----

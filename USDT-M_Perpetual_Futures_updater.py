@@ -108,11 +108,21 @@ DATA_TYPES = [
 
 
 def output_filename(dt, symbol, interval):
+    """Return the data-file path relative to the data folder root.
+
+    Files are stored in per-symbol subdirectories as Parquet:
+        BTCUSDT/BTCUSDT_1d.parquet
+        BTCUSDT/BTCUSDT_markPrice_1d.parquet
+        BTCUSDT/BTCUSDT_metrics.parquet
+    """
     if dt.per_interval:
         if dt.output_suffix:
-            return f"{symbol}_{dt.output_suffix}_{interval}.csv"
-        return f"{symbol}_{interval}.csv"
-    return f"{symbol}_{dt.output_suffix}.csv"
+            name = f"{symbol}_{dt.output_suffix}_{interval}.parquet"
+        else:
+            name = f"{symbol}_{interval}.parquet"
+    else:
+        name = f"{symbol}_{dt.output_suffix}.parquet"
+    return f"{symbol}/{name}"
 
 
 def parse_ym(s):
@@ -254,12 +264,33 @@ def fetch_series(dt, symbol, interval, last_dt, end_date, downloader=download_se
     return normalize_times(pd.concat(frames, ignore_index=True), dt)
 
 
+def _read_file(path, columns=None):
+    """Read a data file — parquet or csv, whichever exists.
+
+    Tries the given *path* first.  If that fails or does not exist,
+    probes the alternate extension (``.csv`` ↔ ``.parquet``).
+    """
+    candidates = [path]
+    if path.endswith(".parquet"):
+        candidates.append(path[:-len(".parquet")] + ".csv")
+    elif path.endswith(".csv"):
+        candidates.append(path[:-len(".csv")] + ".parquet")
+
+    for p in candidates:
+        if not os.path.exists(p):
+            continue
+        try:
+            if p.endswith(".parquet"):
+                return pd.read_parquet(p, columns=columns) if columns else pd.read_parquet(p)
+            return pd.read_csv(p, dtype=str, **(dict(usecols=columns) if columns else {}))
+        except Exception:
+            continue
+    return None
+
+
 def latest_stored_time(path, time_col):
-    if not os.path.exists(path):
-        return None
-    try:
-        df = pd.read_csv(path, usecols=[time_col])
-    except (ValueError, pd.errors.EmptyDataError):
+    df = _read_file(path, columns=[time_col])
+    if df is None or df.empty:
         return None
     if df.empty:
         return None
@@ -282,10 +313,11 @@ def merge_frames(existing_df, new_df, time_col):
 
 
 def merge_datasets(existing_file, new_file, output_file, time_col):
-    new_df = pd.read_csv(new_file, dtype=str)
-    existing_df = pd.read_csv(existing_file, dtype=str) if os.path.exists(existing_file) else None
+    new_df = _read_file(new_file)
+    existing_df = _read_file(existing_file)
     merged = merge_frames(existing_df, new_df, time_col)
-    merged.to_csv(output_file, index=False)
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    merged.to_parquet(output_file, index=False)
     return merged
 
 
@@ -488,13 +520,26 @@ def needs_update(last_dt, end_date, data_path=None, time_col=None):
 
 
 def build_index_from_files(data_folder):
-    """One-time bootstrap: derive the index from CSVs already on disk."""
+    """Bootstrap the index from data files already on disk.
+
+    Probes both nested (per-symbol) and flat (legacy) layouts, and both
+    .parquet and .csv formats, so the migration is seamless.
+    """
     index = {}
     for job in build_jobs():
         filename = output_filename(job.dt, job.symbol, job.interval)
         path = os.path.join(data_folder, filename)
-        if os.path.exists(path):
+        # Check nested path (parquet or legacy csv)
+        if _read_file(path) is not None:
             last = latest_stored_time(path, job.dt.time_col)
+            if last is not None:
+                index[filename] = last.strftime("%Y-%m-%d %H:%M:%S")
+                continue
+        # Fallback: legacy flat layout (pre-migration)
+        flat_name = filename.split("/")[-1]  # strip symbol/ prefix
+        flat_path = os.path.join(data_folder, flat_name)
+        if _read_file(flat_path) is not None:
+            last = latest_stored_time(flat_path, job.dt.time_col)
             if last is not None:
                 index[filename] = last.strftime("%Y-%m-%d %H:%M:%S")
     return index
@@ -503,7 +548,7 @@ def build_index_from_files(data_folder):
 def process_job(dt, symbol, interval, data_folder, end_date, last_dt, downloader=download_series_file):
     out_name = output_filename(dt, symbol, interval)
     data_path = os.path.join(data_folder, out_name)
-    label = out_name.replace(".csv", "")
+    label = os.path.splitext(out_name)[0]
 
     # ---- idempotency check: re-read index from disk ----
     # Another parallel batch may have already processed this job and its
@@ -527,10 +572,11 @@ def process_job(dt, symbol, interval, data_folder, end_date, last_dt, downloader
         logger.info("[%s] no new data (%.1fs)", label, elapsed)
         return None
     new_rows = len(new_df)
-    existing_df = pd.read_csv(data_path, dtype=str) if os.path.exists(data_path) else None
+    existing_df = _read_file(data_path)
     existing_rows = len(existing_df) if existing_df is not None else 0
     merged = merge_frames(existing_df, new_df, dt.time_col)
-    merged.to_csv(data_path, index=False)
+    os.makedirs(os.path.dirname(data_path), exist_ok=True)
+    merged.to_parquet(data_path, index=False)
     new_last = pd.to_datetime(merged[dt.time_col], errors="coerce").max()
     elapsed = time.monotonic() - t0
     ts = new_last.strftime("%Y-%m-%d") if new_last is not pd.NaT else "?"
@@ -580,33 +626,32 @@ Last updated on `pending`
 
 ## Usage
 
+Data is stored as Parquet in per-symbol subdirectories.
+
 ```python
+import pandas as pd
 from datasets import load_dataset
 
 # OHLCV klines
-klines = load_dataset("linxy/USDT-M_Perpetual_Futures", data_files=["BTCUSDT_1d.csv"], split="train")
+klines = load_dataset("linxy/USDT-M_Perpetual_Futures", data_files=["BTCUSDT/BTCUSDT_1d.parquet"], split="train")
 
-# Mark price
-mark = load_dataset("linxy/USDT-M_Perpetual_Futures", data_files=["BTCUSDT_markPrice_1d.csv"], split="train")
-
-# Open interest + long/short ratios
-metrics = load_dataset("linxy/USDT-M_Perpetual_Futures", data_files=["BTCUSDT_metrics.csv"], split="train")
-
-# Funding rate
-funding = load_dataset("linxy/USDT-M_Perpetual_Futures", data_files=["BTCUSDT_fundingRate.csv"], split="train")
+# Or read directly with pandas
+df = pd.read_parquet("hf://datasets/linxy/USDT-M_Perpetual_Futures/BTCUSDT/BTCUSDT_1d.parquet")
 ```
 
 ## Data Types
 
+Files are organised in per-symbol subdirectories (`{symbol}/{symbol}_{suffix}.parquet`).
+
 | File pattern | Content |
 |---|---|
-| `{symbol}_{interval}.csv` | OHLCV klines |
-| `{symbol}_markPrice_{interval}.csv` | Mark price klines |
-| `{symbol}_indexPrice_{interval}.csv` | Index price klines |
-| `{symbol}_premiumIndex_{interval}.csv` | Premium index klines |
-| `{symbol}_metrics.csv` | Open interest, long/short ratios, taker buy/sell |
-| `{symbol}_fundingRate.csv` | Funding rate history |
-| `{symbol}_info.json` | Per-symbol metadata (precision, tick sizes, sector, etc.) |
+| `{symbol}/{symbol}_{interval}.parquet` | OHLCV klines |
+| `{symbol}/{symbol}_markPrice_{interval}.parquet` | Mark price klines |
+| `{symbol}/{symbol}_indexPrice_{interval}.parquet` | Index price klines |
+| `{symbol}/{symbol}_premiumIndex_{interval}.parquet` | Premium index klines |
+| `{symbol}/{symbol}_metrics.parquet` | Open interest, long/short ratios, taker buy/sell |
+| `{symbol}/{symbol}_fundingRate.parquet` | Funding rate history |
+| `{symbol}/{symbol}_info.json` | Per-symbol metadata (precision, tick sizes, sector, etc.) |
 | `meta.json` | Dataset-level metadata (full symbol list, intervals, etc.) |
 | `_index.json` | Updater bookkeeping (internal) |
 

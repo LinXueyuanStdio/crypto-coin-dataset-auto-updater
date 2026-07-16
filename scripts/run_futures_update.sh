@@ -76,18 +76,15 @@ lfs_ensure() {
     git -C "$DATA_DIR" lfs install >/dev/null 2>&1 || true
 
     # Preemptively LFS-track patterns that always grow large.
-    # Redirect stdout too — "already supported" prints to stdout, not stderr.
-    git -C "$DATA_DIR" lfs track '*_5m.csv' '*_15m.csv' '*_30m.csv' '*_metrics.csv' >/dev/null 2>&1 || true
+    git -C "$DATA_DIR" lfs track '*_5m.parquet' '*_15m.parquet' '*_30m.parquet' '*_metrics.parquet' >/dev/null 2>&1 || true
 
-    # Catch any remaining CSV ≥ 9 MiB that didn't match the wildcard patterns
-    # above. Exclude files already covered by *_5m.csv, *_15m.csv, *_30m.csv,
-    # and *_metrics.csv to avoid redundant per-file "git lfs track" calls
-    # (which would just print "already supported").
-    large=$(find "$DATA_DIR" -name '*.csv' -size +9M \
-        ! -name '*_5m.csv' \
-        ! -name '*_15m.csv' \
-        ! -name '*_30m.csv' \
-        ! -name '*_metrics.csv' \
+    # Catch any remaining Parquet files ≥ 9 MiB that didn't match the
+    # wildcard patterns above. Exclude files already covered.
+    large=$(find "$DATA_DIR" -name '*.parquet' -size +9M \
+        ! -name '*_5m.parquet' \
+        ! -name '*_15m.parquet' \
+        ! -name '*_30m.parquet' \
+        ! -name '*_metrics.parquet' \
         -printf '%P\n' 2>/dev/null || true)
     if [ -n "$large" ]; then
         echo "$large" | while IFS= read -r f; do
