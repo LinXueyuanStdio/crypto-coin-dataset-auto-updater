@@ -89,18 +89,29 @@ runs:
       run: |
         echo "::group::Cache miss — cloning fresh"
 
-        for attempt in 1 2 3; do
-          echo "Clone attempt $attempt/3 …"
-          if git clone --depth 1 \
-            "https://hf_user:${{ inputs.hf_token }}@huggingface.co/datasets/${{ inputs.repo_slug }}" \
-            "${{ inputs.data_dir }}" 2>&1; then
-            echo "✅ Fresh clone created at $(cd "${{ inputs.data_dir }}" && git rev-parse --short HEAD)"
-            echo "::endgroup::"
-            exit 0
-          fi
-          echo "Clone failed (attempt $attempt/3), retrying in 30s…"
-          rm -rf "${{ inputs.data_dir }}"
-          sleep 30
+        # Try full clone first (HF sometimes 504s on --depth 1),
+        # then fall back to shallow clone.
+        for strategy in "full" "shallow"; do
+          for attempt in 1 2 3; do
+            echo "Clone attempt $strategy/$attempt …"
+            if [ "$strategy" = "shallow" ]; then
+              git clone --depth 1 \
+                "https://hf_user:${{ inputs.hf_token }}@huggingface.co/datasets/${{ inputs.repo_slug }}" \
+                "${{ inputs.data_dir }}" 2>&1 && ok=1 || ok=0
+            else
+              git clone \
+                "https://hf_user:${{ inputs.hf_token }}@huggingface.co/datasets/${{ inputs.repo_slug }}" \
+                "${{ inputs.data_dir }}" 2>&1 && ok=1 || ok=0
+            fi
+            if [ "$ok" = "1" ]; then
+              echo "✅ Clone OK ($strategy) at $(cd "${{ inputs.data_dir }}" && git rev-parse --short HEAD)"
+              echo "::endgroup::"
+              exit 0
+            fi
+            echo "Clone failed ($strategy/$attempt), waiting $((attempt * 30))s…"
+            rm -rf "${{ inputs.data_dir }}"
+            sleep $((attempt * 30))
+          done
         done
-        echo "❌ Clone failed after 3 attempts"
+        echo "❌ Clone failed after all attempts"
         exit 1
