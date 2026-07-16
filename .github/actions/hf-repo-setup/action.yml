@@ -2,52 +2,38 @@ name: 'HF Dataset Repo Setup'
 description: >
   Cache-aware setup of a HuggingFace dataset repository clone.
 
-  Caches only the .git directory (compressed objects, well under 10 GB).
-  On cache hit the working tree is rebuilt via `git fetch + reset --hard`
-  — no download from HF.  Per-symbol data caches are restored AFTER git
-  operations (see workflow for separate restore step).
+  Two-layer cache:
+    1. .git directory (compressed objects, critical path).
+       Hit  → git fetch + reset --hard rebuilds working tree from local objects.
+       Miss → full clone.
+
+    2. Per-symbol data folders (bonus acceleration).
+       Restored AFTER git operations so they survive git clean -fd.
+       Hit  → data already on disk (skip checkout overhead).
+       Miss → data was already checked out by git reset --hard above.
+
+  Key rotation via cache_suffix (e.g. -0, -1, -2) prevents stale cache.
 
   Usage:
-    # restore (default)
-    - uses: ./.github/actions/hf-repo-setup
-      with: { hf_token: ..., repo_slug: ... }
-
-    # save
-    - uses: ./.github/actions/hf-repo-setup
-      with: { mode: save, hf_token: ..., repo_slug: ... }
+    - uses: ./.github/actions/hf-repo-setup           # restore
+    - uses: ./.github/actions/hf-repo-setup           # save
+      with: { mode: save, ... }
 inputs:
-  hf_token:
-    description: 'HuggingFace token'
-    required: true
-  repo_slug:
-    description: 'HF dataset slug (e.g. linxy/CryptoCoin)'
-    required: true
-  data_dir:
-    description: 'Target directory for the clone'
-    required: false
-    default: 'data'
-  mode:
-    description: '"restore" (default) or "save"'
-    required: false
-    default: 'restore'
-  cache_prefix:
-    description: 'Override cache key prefix (default: repo_slug)'
-    required: false
-    default: ''
-  cache_suffix:
-    description: 'Cache key suffix for rotation (default: none)'
-    required: false
-    default: ''
+  hf_token:        { required: true }
+  repo_slug:       { required: true }
+  data_dir:        { required: false, default: 'data' }
+  mode:            { required: false, default: 'restore' }
+  cache_prefix:    { required: false, default: '' }
+  cache_suffix:    { required: false, default: '' }
 outputs:
   git_cache_hit:
-    description: 'Whether the .git cache was restored'
     value: ${{ steps.restore-git.outputs.cache-hit }}
 
 runs:
   using: 'composite'
   steps:
     # ==================================================================
-    # RESTORE — .git directory only
+    # RESTORE — Step 1: .git cache
     # ==================================================================
     - name: Restore .git cache
       if: inputs.mode == 'restore'
@@ -55,50 +41,44 @@ runs:
       uses: actions/cache/restore@v4
       with:
         path: ${{ inputs.data_dir }}/.git
-        key: >-
-          ${{ inputs.cache_prefix || inputs.repo_slug }}-git${{ inputs.cache_suffix }}
+        key: ${{ inputs.cache_prefix || inputs.repo_slug }}-git${{ inputs.cache_suffix }}
         restore-keys: |
           ${{ inputs.cache_prefix || inputs.repo_slug }}-git
 
     # ==================================================================
-    # RESTORE — .git cache HIT: rebuild working tree from local objects
+    # RESTORE — Step 2a: .git HIT → rebuild working tree
     # ==================================================================
     - name: Sync from .git cache
       if: inputs.mode == 'restore' && steps.restore-git.outputs.cache-hit == 'true'
       shell: bash
       run: |
-        echo "::group::.git cache hit — rebuilding working tree from local objects"
+        echo "::group::.git cache hit — syncing"
         cd "${{ inputs.data_dir }}"
 
-        # Point remote at HF.
         git remote set-url origin \
           "https://hf_user:${{ inputs.hf_token }}@huggingface.co/datasets/${{ inputs.repo_slug }}" \
           2>/dev/null || git remote add origin \
           "https://hf_user:${{ inputs.hf_token }}@huggingface.co/datasets/${{ inputs.repo_slug }}"
 
-        # Rescue uncommitted data from an interrupted previous run.
+        # Rescue uncommitted data from a killed previous run.
         if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
-          echo "⚠ Rescuing uncommitted data from interrupted run"
+          echo "⚠ Rescuing uncommitted data"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
           git add -A && git commit -m "rescue $(date -u +%Y-%m-%dT%H:%M:%SZ)" || true
-          BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-          git push origin "$BRANCH" 2>/dev/null || echo "(push skipped — will reconcile)"
+          git push origin "$(git rev-parse --abbrev-ref HEAD)" 2>/dev/null || true
         fi
 
-        # Fetch + sync. Handles squash, parallel-run pushes, etc.
         git fetch origin main --quiet
         git reset --hard "origin/main"
         git clean -fd
-
-        # Pull LFS objects if the repo uses git-lfs.
         git lfs pull 2>/dev/null || true
 
         echo "✅ Synced — HEAD=$(git rev-parse --short HEAD)"
         echo "::endgroup::"
 
     # ==================================================================
-    # RESTORE — .git cache MISS: full clone
+    # RESTORE — Step 2b: .git MISS → full clone
     # ==================================================================
     - name: Clone dataset
       if: inputs.mode == 'restore' && steps.restore-git.outputs.cache-hit != 'true'
@@ -109,12 +89,8 @@ runs:
         for strategy in "full" "shallow"; do
           for attempt in 1 2 3; do
             echo "Clone $strategy/$attempt …"
-            if [ "$strategy" = "shallow" ]; then
-              git clone --depth 1 "https://hf_user:${{ inputs.hf_token }}@huggingface.co/datasets/${{ inputs.repo_slug }}" "${{ inputs.data_dir }}" 2>&1 && ok=1 || ok=0
-            else
-              git clone "https://hf_user:${{ inputs.hf_token }}@huggingface.co/datasets/${{ inputs.repo_slug }}" "${{ inputs.data_dir }}" 2>&1 && ok=1 || ok=0
-            fi
-            if [ "$ok" = "1" ]; then
+            [ "$strategy" = "shallow" ] && depth="--depth 1" || depth=""
+            if git clone $depth "https://hf_user:${{ inputs.hf_token }}@huggingface.co/datasets/${{ inputs.repo_slug }}" "${{ inputs.data_dir }}" 2>&1; then
               cd "${{ inputs.data_dir }}" && git lfs pull 2>/dev/null || true
               echo "✅ Clone OK ($strategy) — $(cd "${{ inputs.data_dir }}" && git rev-parse --short HEAD)"
               echo "::endgroup::"
@@ -125,11 +101,25 @@ runs:
             sleep $((attempt * 30))
           done
         done
-        echo "❌ Clone failed after all attempts"
+        echo "❌ Clone failed"
         exit 1
 
     # ==================================================================
-    # SAVE — .git directory only
+    # RESTORE — Step 3: symbol data caches (AFTER git ops, purely additive)
+    # ==================================================================
+    - name: Restore symbol caches
+      if: inputs.mode == 'restore'
+      id: restore-symbols
+      uses: actions/cache/restore@v4
+      with:
+        path: |
+          ${{ inputs.data_dir }}/*/
+        key: ${{ inputs.cache_prefix || inputs.repo_slug }}-data${{ inputs.cache_suffix }}
+        restore-keys: |
+          ${{ inputs.cache_prefix || inputs.repo_slug }}-data
+
+    # ==================================================================
+    # SAVE — .git
     # ==================================================================
     - name: Save .git cache
       if: inputs.mode == 'save'
@@ -137,5 +127,16 @@ runs:
       uses: actions/cache/save@v4
       with:
         path: ${{ inputs.data_dir }}/.git
-        key: >-
-          ${{ inputs.cache_prefix || inputs.repo_slug }}-git${{ inputs.cache_suffix }}
+        key: ${{ inputs.cache_prefix || inputs.repo_slug }}-git${{ inputs.cache_suffix }}
+
+    # ==================================================================
+    # SAVE — per-symbol data folders
+    # ==================================================================
+    - name: Save symbol caches
+      if: inputs.mode == 'save'
+      id: save-symbols
+      uses: actions/cache/save@v4
+      with:
+        path: |
+          ${{ inputs.data_dir }}/*/
+        key: ${{ inputs.cache_prefix || inputs.repo_slug }}-data${{ inputs.cache_suffix }}
