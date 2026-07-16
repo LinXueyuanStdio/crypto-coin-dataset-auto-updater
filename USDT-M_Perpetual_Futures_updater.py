@@ -299,11 +299,16 @@ def latest_stored_time(path, time_col):
 
 
 def merge_frames(existing_df, new_df, time_col):
+    # Normalise all timestamp columns — existing parquets may have
+    # string timestamps from migration (which used dtype=str).
+    TS_COLS = {'open_time', 'close_time', 'calc_time', 'create_time'}
     new_df = new_df.copy()
-    new_df[time_col] = pd.to_datetime(new_df[time_col], errors="coerce")
+    for col in TS_COLS & set(new_df.columns):
+        new_df[col] = pd.to_datetime(new_df[col], errors='coerce')
     if existing_df is not None and len(existing_df):
         existing_df = existing_df.copy()
-        existing_df[time_col] = pd.to_datetime(existing_df[time_col], errors="coerce")
+        for col in TS_COLS & set(existing_df.columns):
+            existing_df[col] = pd.to_datetime(existing_df[col], errors='coerce')
         merged = pd.concat([existing_df, new_df], ignore_index=True)
     else:
         merged = new_df
