@@ -794,7 +794,12 @@ def run_update(data_folder, end_date=None, budget=None, max_workers=None,
     # ---- batch sharding by symbol (stable, idempotent) ----
     if batch_total > 1:
         all_symbols = sorted({job.symbol for job in all_jobs})
-        my_symbols = {sym for i, sym in enumerate(all_symbols) if i % batch_total == batch_index}
+        # Contiguous sharding: each batch gets a contiguous block of symbols.
+        # batch 0 → first 1/N, batch N-1 → last 1/N.
+        chunk = (len(all_symbols) + batch_total - 1) // batch_total
+        start = batch_index * chunk
+        end = start + chunk if batch_index < batch_total - 1 else len(all_symbols)
+        my_symbols = set(all_symbols[start:end])
         assigned_jobs = sum(1 for job in all_jobs if job.symbol in my_symbols)
         logger.info(
             "Batch %d/%d: %d symbols (%d jobs) of %d total symbols (%d total jobs)",
