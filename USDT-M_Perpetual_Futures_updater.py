@@ -445,9 +445,18 @@ def load_index(data_folder):
 
 
 def save_index(data_folder, index):
+    """Merge-safe index write — never loses entries pushed by parallel runs.
+
+    Reads the current on-disk index first (which may have been updated by
+    ``git pull`` bringing in commits from another parallel batch), merges
+    in the local updates, then writes back. This ensures the index is an
+    ever-growing union, not a last-writer-wins snapshot.
+    """
     path = os.path.join(data_folder, INDEX_FILENAME)
+    existing = load_index(data_folder)
+    existing.update(index)
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(index, f, indent=0, sort_keys=True)
+        json.dump(existing, f, indent=0, sort_keys=True)
 
 
 def index_last_dt(index, filename):
@@ -458,8 +467,24 @@ def index_last_dt(index, filename):
     return None if pd.isna(ts) else ts.to_pydatetime()
 
 
-def needs_update(last_dt, end_date):
-    return last_dt is None or last_dt.date() < end_date
+def needs_update(last_dt, end_date, data_path=None, time_col=None):
+    """Determine whether a series needs fetching.
+
+    Uses the in-memory index timestamp first.  When the index suggests the
+    series is already current, we perform a secondary check against the
+    actual CSV on disk — the index may be stale if it was written from a
+    parallel run whose ``save_index`` we pulled after the fetch was done.
+    """
+    if last_dt is not None and last_dt.date() >= end_date:
+        # Secondary check: read the actual CSV timestamp
+        if data_path and time_col:
+            actual_last = latest_stored_time(data_path, time_col)
+            if actual_last is not None and actual_last.date() >= end_date:
+                return False
+            # Index says current but CSV disagrees — trust the CSV
+            return True
+        return False
+    return True
 
 
 def build_index_from_files(data_folder):
@@ -685,13 +710,18 @@ def stamp_readme(path):
         f.write(body)
 
 
-def run_update(data_folder, end_date=None, budget=None, max_workers=None):
+def run_update(data_folder, end_date=None, budget=None, max_workers=None,
+               batch_total=None, batch_index=None):
     if end_date is None:
         end_date = datetime.now(timezone.utc).date() - timedelta(days=1)
     if budget is None:
         budget = Budget(float(os.getenv("MAX_RUNTIME_MIN", "90")))
     if max_workers is None:
         max_workers = int(os.getenv("FETCH_WORKERS", "8" if PROXY else "64"))
+    if batch_total is None:
+        batch_total = int(os.getenv("BATCH_TOTAL", "1"))
+    if batch_index is None:
+        batch_index = int(os.getenv("BATCH_INDEX", "0"))
 
     index = load_index(data_folder)
     if not index:
@@ -703,9 +733,24 @@ def run_update(data_folder, end_date=None, budget=None, max_workers=None):
     pending = []
     for job in all_jobs:
         filename = output_filename(job.dt, job.symbol, job.interval)
+        data_path = os.path.join(data_folder, filename)
         last_dt = index_last_dt(index, filename)
-        if needs_update(last_dt, end_date):
+        if needs_update(last_dt, end_date, data_path, job.dt.time_col):
             pending.append((job, filename, last_dt))
+
+    # ---- batch sharding ----
+    if batch_total > 1:
+        filtered = []
+        for i, item in enumerate(pending):
+            if i % batch_total == batch_index:
+                filtered.append(item)
+        logger.info(
+            "Batch %d/%d: %d/%d jobs assigned (%d skipped)",
+            batch_index + 1, batch_total, len(filtered), len(pending),
+            len(pending) - len(filtered),
+        )
+        pending = filtered
+
     logger.info("%d/%d series need update (end_date=%s)", len(pending), len(all_jobs), end_date)
 
     jobs = iter(pending)
@@ -776,6 +821,8 @@ def run_update(data_folder, end_date=None, budget=None, max_workers=None):
         "end_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "elapsed_seconds": round(elapsed, 1),
         "budget_limit_min": budget.limit_seconds / 60.0,
+        "batch_index": batch_index,
+        "batch_total": batch_total,
         "total_pending": total_pending,
         "produced": produced,
         "failed": failed,
@@ -822,7 +869,12 @@ def main():
     data_folder = os.path.join(BASE_DIR, os.getenv("DATA_DIR", "data"))
     os.makedirs(data_folder, exist_ok=True)
 
+    batch_total = int(os.getenv("BATCH_TOTAL", "1"))
+    batch_index = int(os.getenv("BATCH_INDEX", "0"))
+    is_master = (batch_index == 0)
+
     logger.info("Starting USDT-M perpetual futures update -> %s", dataset_slug)
+    logger.info("Batch %d/%d (master=%s)", batch_index + 1, batch_total, is_master)
     resolve_symbols()
 
     # COINS env var (comma-separated) restricts to a symbol subset.
@@ -839,25 +891,35 @@ def main():
 
     run_update(data_folder)
 
-    readme_path = os.path.join(data_folder, "README.md")
-    ensure_readme(readme_path)
-    stamp_readme(readme_path)
+    # ---- master batch responsibilities ----
+    # Only the master batch updates shared metadata files (README, meta.json)
+    # and performs the final HF upload. Non-master batches rely on the
+    # auto-push in run_futures_update.sh to checkpoint their data.
+    if is_master:
+        readme_path = os.path.join(data_folder, "README.md")
+        ensure_readme(readme_path)
+        stamp_readme(readme_path)
 
-    if not os.getenv("HF_TOKEN"):
-        logger.warning("HF_TOKEN not set — skipping upload (local dev run)")
-    elif os.getenv("COINS", "").strip():
-        logger.warning("COINS is set — skipping upload (local test run)")
-    else:
-        notes = datetime.now(timezone.utc).strftime("Updated at %B %d %Y %H:%M:%S UTC")
-        for attempt in range(1, 11):
-            try:
-                upload(data_folder, dataset_slug, notes)
-                break
-            except Exception as e:
-                logger.error("Upload attempt %d/10 failed: %s. Retrying in 60s...", attempt, e)
-                time.sleep(60)
+        if not os.getenv("HF_TOKEN"):
+            logger.warning("HF_TOKEN not set — skipping upload (local dev run)")
+        elif os.getenv("COINS", "").strip():
+            logger.warning("COINS is set — skipping upload (local test run)")
         else:
-            raise RuntimeError("Upload failed after 10 attempts")
+            notes = datetime.now(timezone.utc).strftime("Updated at %B %d %Y %H:%M:%S UTC")
+            for attempt in range(1, 11):
+                try:
+                    upload(data_folder, dataset_slug, notes)
+                    break
+                except Exception as e:
+                    logger.error("Upload attempt %d/10 failed: %s. Retrying in 60s...", attempt, e)
+                    time.sleep(60)
+            else:
+                raise RuntimeError("Upload failed after 10 attempts")
+    else:
+        logger.info(
+            "Non-master batch — skipping README/meta.json update and HF upload "
+            "(data will be checkpointed by wrapper's auto-push)"
+        )
 
 
 if __name__ == "__main__":
