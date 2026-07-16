@@ -731,25 +731,24 @@ def run_update(data_folder, end_date=None, budget=None, max_workers=None,
 
     all_jobs = build_jobs()
     pending = []
-    for job in all_jobs:
+    for i, job in enumerate(all_jobs):
+        # ---- batch sharding (stable by all_jobs index, idempotent) ----
+        # Shard BEFORE needs_update so a job always belongs to the same batch,
+        # regardless of what was already processed in prior runs.
+        if batch_total > 1 and i % batch_total != batch_index:
+            continue
         filename = output_filename(job.dt, job.symbol, job.interval)
         data_path = os.path.join(data_folder, filename)
         last_dt = index_last_dt(index, filename)
         if needs_update(last_dt, end_date, data_path, job.dt.time_col):
             pending.append((job, filename, last_dt))
 
-    # ---- batch sharding ----
     if batch_total > 1:
-        filtered = []
-        for i, item in enumerate(pending):
-            if i % batch_total == batch_index:
-                filtered.append(item)
+        assigned = (len(all_jobs) + batch_total - 1 - batch_index) // batch_total
         logger.info(
-            "Batch %d/%d: %d/%d jobs assigned (%d skipped)",
-            batch_index + 1, batch_total, len(filtered), len(pending),
-            len(pending) - len(filtered),
+            "Batch %d/%d: ~%d/%d jobs assigned to this batch (%d need update)",
+            batch_index + 1, batch_total, assigned, len(all_jobs), len(pending),
         )
-        pending = filtered
 
     logger.info("%d/%d series need update (end_date=%s)", len(pending), len(all_jobs), end_date)
 
