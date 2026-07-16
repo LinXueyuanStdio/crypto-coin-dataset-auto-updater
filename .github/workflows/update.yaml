@@ -117,4 +117,3 @@ jobs:
           hf_token: ${{ secrets.HF_TOKEN }}
           repo_slug: linxy/CryptoCoin
           data_dir: data
-          cache_suffix: -${{ github.run_number % 3 }}

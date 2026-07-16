@@ -69,9 +69,14 @@ runs:
           git push origin "$(git rev-parse --abbrev-ref HEAD)" 2>/dev/null || true
         fi
 
+        # Merge remote into local — preserves existing files.
+        # reset --hard would wipe the working tree, destroying the
+        # symbol cache data restored in step 4.
         git fetch origin main --quiet
-        git reset --hard "origin/main"
-        git clean -fd
+        git merge "origin/main" --ff-only 2>/dev/null || {
+          echo "Fast-forward not possible (squash detected) — resetting"
+          git reset --hard "origin/main"
+        }
         git lfs pull 2>/dev/null || true
 
         echo "✅ Synced — HEAD=$(git rev-parse --short HEAD)"
