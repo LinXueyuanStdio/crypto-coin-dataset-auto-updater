@@ -504,6 +504,16 @@ def process_job(dt, symbol, interval, data_folder, end_date, last_dt, downloader
     out_name = output_filename(dt, symbol, interval)
     data_path = os.path.join(data_folder, out_name)
     label = out_name.replace(".csv", "")
+
+    # ---- idempotency check: re-read index from disk ----
+    # Another parallel batch may have already processed this job and its
+    # _index.json entry was pulled by the shell wrapper since we last loaded.
+    fresh_index = load_index(data_folder)
+    fresh_last = index_last_dt(fresh_index, out_name)
+    if not needs_update(fresh_last, end_date, data_path, dt.time_col):
+        logger.info("[%s] already up-to-date (another batch did it) — skip", label)
+        return None
+
     t0 = time.monotonic()
     logger.info("[%s] fetching ...", label)
     try:
@@ -759,6 +769,8 @@ def run_update(data_folder, end_date=None, budget=None, max_workers=None,
     total_pending = len(pending)
     last_log_at = time.monotonic()
     PROGRESS_LOG_EVERY_S = 60  # emit a progress line at most every N seconds
+    CHECKPOINT_EVERY_N = 20    # save + reload index every N completed jobs
+    checkpoint_pending = 0
     t_start = time.monotonic()
 
     # per-symbol stats for the run summary
@@ -794,6 +806,20 @@ def run_update(data_folder, end_date=None, budget=None, max_workers=None,
                     failed += 1
                     symbol_failed.setdefault(symbol, []).append((filename, str(e)))
                     logger.warning("series failed: %s", e)
+
+                checkpoint_pending += 1
+
+            # ---- periodic checkpoint: save + reload index ----
+            # Saves our progress to disk so the shell wrapper can push it.
+            # Reloads from disk to incorporate other batches' _index.json
+            # entries that were git-pulled by the wrapper since last load.
+            if checkpoint_pending >= CHECKPOINT_EVERY_N:
+                save_index(data_folder, index)
+                fresh = load_index(data_folder)
+                fresh.update(index)  # our in-memory entries win over disk
+                index = fresh
+                checkpoint_pending = 0
+
             now = time.monotonic()
             if now - last_log_at >= PROGRESS_LOG_EVERY_S:
                 done_so_far = produced + failed
