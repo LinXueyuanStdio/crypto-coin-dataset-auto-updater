@@ -26,7 +26,7 @@ jobs:
       # ------------------------------------------------------------------
       # Clone + undo any broken rescue commits
       # ------------------------------------------------------------------
-      - name: Clone dataset and undo rescue commits
+      - name: Clone dataset
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
@@ -48,19 +48,6 @@ jobs:
           cd data
           git config user.email "migration-bot[bot]@users.noreply.github.com"
           git config user.name "migration-bot[bot]"
-
-          # Undo any rescue commits (empty working-tree pushes)
-          CURRENT=$(git log --oneline -1)
-          if echo "$CURRENT" | grep -q "rescue"; then
-            echo "Found rescue commit: $CURRENT"
-            echo "Resetting to HEAD~1 …"
-            git reset --hard HEAD~1
-            git push origin main --force
-            echo "✅ Rescue commit undone"
-          else
-            echo "Latest commit is NOT a rescue — proceeding"
-            echo "  $CURRENT"
-          fi
 
       - name: Install dependencies
         run: pip install pandas pyarrow huggingface_hub
