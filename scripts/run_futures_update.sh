@@ -142,7 +142,7 @@ push_progress() {
 #   our pull but before our push.
 # ---------------------------------------------------------------------------
 push_with_retry() {
-    local max_attempts=3
+    local max_attempts=5
     local attempt=0
 
     while [ "$attempt" -lt "$max_attempts" ]; do
@@ -153,22 +153,25 @@ push_with_retry() {
             return 0
         fi
 
-        log "Push failed (attempt $attempt/$max_attempts): $push_out"
+        log "Push failed (attempt $attempt/$max_attempts): $(echo "$push_out" | head -1)"
+
+        # Rate limit detection — extract Retry-After seconds from HF's 429
+        if echo "$push_out" | grep -q "429\|rate.limit\|Too Many Requests"; then
+            retry_sec=$(echo "$push_out" | grep -oP 'Retry after \K\d+' | head -1)
+            wait="${retry_sec:-$((attempt * 60))}"
+            log "Rate limited — waiting ${wait}s…"
+            sleep "$wait"
+            # Don't undo commit for rate limits — just retry the same push
+            continue
+        fi
 
         if [ "$attempt" -lt "$max_attempts" ]; then
-            log "Someone else pushed — undoing commit, re-syncing, and retrying…"
+            log "Push conflict — undoing commit, re-syncing, and retrying…"
 
-            # a. Undo our commit but keep changes in working tree
             git -C "$DATA_DIR" reset --soft HEAD~1
-
-            # b. Stash changes temporarily
             git -C "$DATA_DIR" stash --include-untracked
-
-            # c. Sync to latest remote state
             git -C "$DATA_DIR" fetch origin main --quiet
             git -C "$DATA_DIR" reset --hard origin/main
-
-            # d. Pop our changes back
             if git -C "$DATA_DIR" stash pop 2>/dev/null; then
                 log "Stash popped cleanly"
             else
@@ -177,18 +180,18 @@ push_with_retry() {
                 git -C "$DATA_DIR" reset HEAD . 2>/dev/null || true
             fi
 
-            # e. Re-stage and re-commit
             lfs_ensure
             git -C "$DATA_DIR" add -A
             if [ -z "$(git -C "$DATA_DIR" status --porcelain)" ]; then
-                log "No changes after re-sync (merged into remote already)"
+                log "No changes after re-sync"
                 return 0
             fi
             git -C "$DATA_DIR" commit -m "auto-save $(date -u +%Y-%m-%dT%H:%M:%SZ) [retry $attempt]"
+            sleep $((attempt * 10))
         fi
     done
 
-    log "ERROR: Push failed after $max_attempts attempts — changes remain in working tree"
+    log "ERROR: Push failed after $max_attempts attempts"
     return 1
 }
 
