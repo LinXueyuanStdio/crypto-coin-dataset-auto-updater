@@ -785,25 +785,30 @@ def run_update(data_folder, end_date=None, budget=None, max_workers=None,
             logger.info("Bootstrapped index from %d existing files", len(index))
 
     all_jobs = build_jobs()
+
+    # ---- batch sharding by symbol (stable, idempotent) ----
+    if batch_total > 1:
+        all_symbols = sorted({job.symbol for job in all_jobs})
+        my_symbols = {sym for i, sym in enumerate(all_symbols) if i % batch_total == batch_index}
+        assigned_jobs = sum(1 for job in all_jobs if job.symbol in my_symbols)
+        logger.info(
+            "Batch %d/%d: %d symbols (%d jobs) of %d total symbols (%d total jobs)",
+            batch_index + 1, batch_total,
+            len(my_symbols), assigned_jobs,
+            len(all_symbols), len(all_jobs),
+        )
+    else:
+        my_symbols = None
+
     pending = []
-    for i, job in enumerate(all_jobs):
-        # ---- batch sharding (stable by all_jobs index, idempotent) ----
-        # Shard BEFORE needs_update so a job always belongs to the same batch,
-        # regardless of what was already processed in prior runs.
-        if batch_total > 1 and i % batch_total != batch_index:
+    for job in all_jobs:
+        if my_symbols is not None and job.symbol not in my_symbols:
             continue
         filename = output_filename(job.dt, job.symbol, job.interval)
         data_path = os.path.join(data_folder, filename)
         last_dt = index_last_dt(index, filename)
         if needs_update(last_dt, end_date, data_path, job.dt.time_col):
             pending.append((job, filename, last_dt))
-
-    if batch_total > 1:
-        assigned = (len(all_jobs) + batch_total - 1 - batch_index) // batch_total
-        logger.info(
-            "Batch %d/%d: ~%d/%d jobs assigned to this batch (%d need update)",
-            batch_index + 1, batch_total, assigned, len(all_jobs), len(pending),
-        )
 
     logger.info("%d/%d series need update (end_date=%s)", len(pending), len(all_jobs), end_date)
 
