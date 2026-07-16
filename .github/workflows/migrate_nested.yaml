@@ -49,6 +49,7 @@ jobs:
           python3 -c "
           import os, sys, json
           from collections import defaultdict
+          from pathlib import Path
           import pandas as pd
           from huggingface_hub import HfApi, CommitOperationAdd, CommitOperationDelete
 
@@ -86,7 +87,7 @@ jobs:
                   csv_path = os.path.join(sym, csv)
                   if not os.path.exists(csv_path):
                       continue
-                  pq_path = csv_path[:-4] + '.parquet'
+                  pq_path = str(Path(csv_path).with_suffix('.parquet'))
                   df = pd.read_csv(csv_path, dtype=str)
                   df.to_parquet(pq_path, index=False, compression='zstd')
                   os.remove(csv_path)
