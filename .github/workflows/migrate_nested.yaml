@@ -106,13 +106,46 @@ jobs:
           " || echo "(no _index.json — will be built from parquet files)"
           fi
 
-          echo "=== Step 4: Commit + push ==="
-          git add -A
-          if [ -z "$(git status --porcelain)" ]; then
-            echo "No changes — already migrated"
-            exit 0
-          fi
-          git commit -m "migrate: per-symbol folders + Parquet format ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
-          BRANCH=$(git rev-parse --abbrev-ref HEAD)
-          git push origin "$BRANCH" --force
+          echo "=== Step 4: Upload via huggingface_hub create_commit ==="
+          # Use create_commit to batch all file operations into ONE API call,
+          # avoiding the per-file LFS rate limit that `git push` triggers.
+          python3 -c "
+          import os, sys
+          from huggingface_hub import HfApi, CommitOperationAdd, CommitOperationDelete
+
+          api = HfApi(token=os.environ['HF_TOKEN'])
+          repo = 'linxy/USDT-M_Perpetual_Futures'
+          ops = []
+
+          # (a) Delete old flat CSV files from repo root
+          try:
+              files = api.list_repo_files(repo, repo_type='dataset')
+              old_csvs = [f for f in files if f.endswith('.csv') and '/' not in f]
+              print(f'Deleting {len(old_csvs)} old flat CSV files …')
+              for f in old_csvs:
+                  ops.append(CommitOperationDelete(path_in_repo=f))
+          except Exception as e:
+              print(f'Could not list remote files: {e}')
+
+          # (b) Add new Parquet files and metadata
+          for root, dirs, files in os.walk('.'):
+              # skip .git
+              if '.git' in root.split(os.sep):
+                  continue
+              for f in files:
+                  if f in ('.git', '.gitignore', '.gitattributes'):
+                      continue
+                  path = os.path.join(root, f).lstrip('./')
+                  ops.append(CommitOperationAdd(path_in_repo=path, path_or_fileobj=path))
+
+          print(f'Creating commit with {len(ops)} operations …')
+          api.create_commit(
+              repo_id=repo,
+              repo_type='dataset',
+              commit_message='migrate: per-symbol folders + Parquet format',
+              commit_description='Reorganised into {symbol}/{symbol}_suffix.parquet layout; CSV converted to Parquet (zstd)',
+              operations=ops,
+          )
+          print(f'Commit created — {len(ops)} operations')
+          " 2>&1
           echo "=== Migration complete ==="
