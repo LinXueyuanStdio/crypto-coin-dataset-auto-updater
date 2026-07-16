@@ -12,7 +12,7 @@ on:
 jobs:
   migrate:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 120
 
     steps:
       - name: Check out repository
@@ -68,21 +68,24 @@ jobs:
           echo "Moved $moved CSV files into per-symbol folders"
 
           echo "=== Step 2: Convert CSVs to Parquet and delete CSVs ==="
-          converted=0
           python3 -c "
-          import os, pandas as pd
+          import os, sys, pandas as pd
+          total = sum(1 for _, _, fs in os.walk('.') for f in fs if f.endswith('.csv'))
+          done = 0
           for root, dirs, files in os.walk('.'):
               for f in files:
                   if not f.endswith('.csv'):
                       continue
                   csv_path = os.path.join(root, f)
                   pq_path = csv_path[:-4] + '.parquet'
-                  print(f'  {csv_path} → {pq_path}')
                   df = pd.read_csv(csv_path, dtype=str)
                   df.to_parquet(pq_path, index=False, compression='zstd')
                   os.remove(csv_path)
-          " 2>&1 | tail -5
-          echo "Conversion done"
+                  done += 1
+                  if done % 50 == 0 or done == total:
+                      print(f'  [{done}/{total}] converted', flush=True)
+          print(f'Completed: {done}/{total} files')
+          " 2>&1
 
           echo "=== Step 3: Update _index.json keys ==="
           if [ -f _index.json ]; then
