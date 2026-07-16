@@ -4,12 +4,17 @@
 # periodically pushes partial progress to Hugging Face so that data is never
 # lost if the process is killed (CI timeout, OOM, etc.).
 #
+# Designed for safe parallel execution: each auto-push pulls latest from
+# remote first (merge-safe), and failed pushes retry with stash+rebase.
+#
 # Usage:
 #   ./scripts/run_futures_update.sh
 #
 # Environment variables honoured:
 #   PUSH_INTERVAL_SEC  – seconds between auto-pushes (default 1800 = 30 min)
 #   DATA_DIR           – path to the cloned HF dataset repo   (default data/)
+#   BATCH_TOTAL        – total parallel batches (default 1)
+#   BATCH_INDEX        – this run's batch number, 0-based (default 0)
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
@@ -18,8 +23,6 @@ DATA_DIR="${DATA_DIR:-data}"
 UPDATER_SCRIPT="USDT-M_Perpetual_Futures_updater.py"
 OUTPUT_DIR="${OUTPUT_DIR:-output}"
 LOG_FILE="${LOG_FILE:-${OUTPUT_DIR}/futures_update.log}"
-# COINS: comma-separated list to restrict processing (for quick local tests).
-#   e.g. COINS=BTCUSDT,ETHUSDT bash scripts/run_futures_update.sh
 COINS="${COINS:-}"
 
 # Force UTF-8 everywhere — avoids mojibake in the log file on Windows.
@@ -35,49 +38,165 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 
 log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"; }
 
-push_progress() {
-    log ">>> Auto-pushing progress to HF …"
-    if [ ! -d "$DATA_DIR/.git" ]; then
-        log "data/ is not a git repo — skipping push (local dev)"
-        return
-    fi
+# ---------------------------------------------------------------------------
+# merge_safe_pull — pull latest from remote, handling conflicts gracefully.
+#   On success (no local changes to lose): pulls with rebase.
+#   On rebase conflict: stashes local changes, resets to origin/main,
+#   then pops the stash back — local uncommitted data is never lost.
+# ---------------------------------------------------------------------------
+merge_safe_pull() {
     if [ -z "$(git -C "$DATA_DIR" status --porcelain)" ]; then
-        log "No changes to push."
-        return
+        # No local changes — safe to just pull
+        log "Pulling latest from origin (clean working tree)…"
+        git -C "$DATA_DIR" fetch origin main --quiet
+        git -C "$DATA_DIR" reset --hard origin/main
+        return 0
     fi
 
-    # Ensure git-lfs hooks are active before staging anything.
+    log "Pulling latest from origin (with local changes)…"
+    if git -C "$DATA_DIR" pull --rebase origin main 2>&1; then
+        log "Pull OK"
+        return 0
+    fi
+
+    # Rebase conflict: stash → reset → pull → pop
+    log "WARNING: pull --rebase had conflicts — resolving via stash"
+    git -C "$DATA_DIR" stash --include-untracked 2>/dev/null || true
+    git -C "$DATA_DIR" fetch origin main --quiet
+    git -C "$DATA_DIR" reset --hard origin/main
+    if git -C "$DATA_DIR" stash pop 2>/dev/null; then
+        log "Stash popped cleanly after reset"
+    else
+        # Stash pop may have merge conflicts in the working tree —
+        # that's OK, the files are there; the Python updater will
+        # reconcile via load_index() + save_index() merge logic.
+        log "Stash pop had conflicts (files are in working tree — updater will reconcile)"
+        git -C "$DATA_DIR" checkout --theirs . 2>/dev/null || true
+        git -C "$DATA_DIR" reset HEAD . 2>/dev/null || true
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# lfs_ensure — make sure all large CSV files are tracked by git-lfs before
+#   committing, so the HF repo doesn't accumulate giant blobs.
+# ---------------------------------------------------------------------------
+lfs_ensure() {
     git -C "$DATA_DIR" lfs install 2>/dev/null || true
 
-    # Preemptively LFS-track patterns that always grow large (5m/15m/30m
-    # klines + metrics).  These would exceed 10 MiB sooner or later.
+    # Preemptively LFS-track patterns that always grow large.
     git -C "$DATA_DIR" lfs track '*_5m.csv' '*_15m.csv' '*_30m.csv' '*_metrics.csv' 2>/dev/null || true
 
-    # Stage everything …
-    git -C "$DATA_DIR" add -A
-
-    # Catch any remaining CSV ≥ 9 MiB that didn't match the patterns above
-    # (e.g. new intervals, fundingRate for very active coins).
-    large=$(find "$DATA_DIR" -name '*.csv' -size +9M -printf '%P\n' 2>/dev/null)
+    # Catch any remaining CSV ≥ 9 MiB that didn't match the patterns.
+    large=$(find "$DATA_DIR" -name '*.csv' -size +9M -printf '%P\n' 2>/dev/null || true)
     if [ -n "$large" ]; then
         echo "$large" | while IFS= read -r f; do
             git -C "$DATA_DIR" lfs track "$f" 2>/dev/null || true
         done
-        git -C "$DATA_DIR" add .gitattributes 2>/dev/null || true
-        git -C "$DATA_DIR" add -A   # re-stage — large files become LFS pointers
         log "LFS-tracked $(echo "$large" | wc -l) extra file(s) ≥9 MiB"
-    fi
-
-    if git -C "$DATA_DIR" commit -m "auto-save $(date -u +%Y-%m-%dT%H:%M:%SZ)" 2>&1; then
-        log "Commit OK, pushing …"
-        push_out=$(git -C "$DATA_DIR" push origin main 2>&1) && \
-            log "Push OK: $push_out" || \
-            log "WARNING: push failed: $push_out"
-    else
-        log "Nothing to commit."
     fi
 }
 
+# ---------------------------------------------------------------------------
+# push_progress — the core checkpoint routine.
+#   1. Pull latest (merge-safe — handles parallel runs)
+#   2. LFS setup
+#   3. Stage everything
+#   4. Commit + push
+#   5. On push conflict (another run pushed first):
+#      undo commit → stash → pull → pop → recommit → push (up to 3 retries)
+# ---------------------------------------------------------------------------
+push_progress() {
+    log ">>> Auto-pushing progress to HF …"
+
+    if [ ! -d "$DATA_DIR/.git" ]; then
+        log "data/ is not a git repo — skipping push (local dev)"
+        return 0
+    fi
+
+    # 1. Sync with remote first (so index merges don't get lost)
+    merge_safe_pull
+
+    # 2. LFS tracking
+    lfs_ensure
+
+    # 3. Stage everything
+    git -C "$DATA_DIR" add -A
+
+    if [ -z "$(git -C "$DATA_DIR" status --porcelain)" ]; then
+        log "No changes to push."
+        return 0
+    fi
+
+    # 4. Commit
+    local commit_msg="auto-save $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    if ! git -C "$DATA_DIR" commit -m "$commit_msg" 2>&1; then
+        log "Nothing to commit."
+        return 0
+    fi
+    log "Commit OK, pushing …"
+
+    # 5. Push with retry on race condition
+    push_with_retry
+}
+
+# ---------------------------------------------------------------------------
+# push_with_retry — handles the race where another parallel run pushed after
+#   our pull but before our push.
+# ---------------------------------------------------------------------------
+push_with_retry() {
+    local max_attempts=3
+    local attempt=0
+
+    while [ "$attempt" -lt "$max_attempts" ]; do
+        attempt=$((attempt + 1))
+
+        if push_out=$(git -C "$DATA_DIR" push origin main 2>&1); then
+            log "Push OK"
+            return 0
+        fi
+
+        log "Push failed (attempt $attempt/$max_attempts): $push_out"
+
+        if [ "$attempt" -lt "$max_attempts" ]; then
+            log "Someone else pushed — undoing commit, re-syncing, and retrying…"
+
+            # a. Undo our commit but keep changes in working tree
+            git -C "$DATA_DIR" reset --soft HEAD~1
+
+            # b. Stash changes temporarily
+            git -C "$DATA_DIR" stash --include-untracked
+
+            # c. Sync to latest remote state
+            git -C "$DATA_DIR" fetch origin main --quiet
+            git -C "$DATA_DIR" reset --hard origin/main
+
+            # d. Pop our changes back
+            if git -C "$DATA_DIR" stash pop 2>/dev/null; then
+                log "Stash popped cleanly"
+            else
+                log "Stash pop had conflicts — keeping our version"
+                git -C "$DATA_DIR" checkout --theirs . 2>/dev/null || true
+                git -C "$DATA_DIR" reset HEAD . 2>/dev/null || true
+            fi
+
+            # e. Re-stage and re-commit
+            lfs_ensure
+            git -C "$DATA_DIR" add -A
+            if [ -z "$(git -C "$DATA_DIR" status --porcelain)" ]; then
+                log "No changes after re-sync (merged into remote already)"
+                return 0
+            fi
+            git -C "$DATA_DIR" commit -m "auto-save $(date -u +%Y-%m-%dT%H:%M:%SZ) [retry $attempt]"
+        fi
+    done
+
+    log "ERROR: Push failed after $max_attempts attempts — changes remain in working tree"
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# cleanup — signal handler: push final state before exit
+# ---------------------------------------------------------------------------
 cleanup() {
     log ">>> Caught signal – pushing final state before exit …"
     push_progress
@@ -90,6 +209,7 @@ trap cleanup SIGTERM SIGINT SIGHUP
 # ---- main ------------------------------------------------------------------
 log "=== Starting futures updater wrapper ==="
 log "Push interval: ${PUSH_INTERVAL_SEC}s  |  Data dir: $DATA_DIR"
+log "Batch: ${BATCH_INDEX:-0}/${BATCH_TOTAL:-1}  |  Workers: ${FETCH_WORKERS:-64}"
 
 # Ensure git user is configured for auto-push commits.
 if ! git -C "$DATA_DIR" config user.email >/dev/null 2>&1; then
@@ -99,7 +219,7 @@ if ! git -C "$DATA_DIR" config user.email >/dev/null 2>&1; then
 fi
 
 # Launch the Python updater in the background.
-# COINS (and other env vars) are inherited by the Python process.
+# BATCH_TOTAL, BATCH_INDEX, and other env vars are inherited by the Python process.
 poetry run python "$UPDATER_SCRIPT" &
 UPDATER_PID=$!
 log "Python updater started (PID=$UPDATER_PID)"
