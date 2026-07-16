@@ -5,20 +5,45 @@ on:
   schedule:
     - cron: "0 2 * * 6"
   workflow_dispatch:
+    inputs:
+      batch_total:
+        description: 'Total number of parallel batches (split work across N runs)'
+        required: false
+        default: '1'
+        type: string
+      batch_index:
+        description: 'This run''s batch number (0-based, only processes jobs where job_index % batch_total == batch_index)'
+        required: false
+        default: '0'
+        type: string
+      fetch_workers:
+        description: 'Number of parallel fetch workers (concurrent downloads)'
+        required: false
+        default: '64'
+        type: string
+      push_interval_sec:
+        description: 'Seconds between auto-push checkpoints (shorter = less data loss on kill)'
+        required: false
+        default: '60'
+        type: string
+      max_runtime_min:
+        description: 'Soft runtime budget in minutes (updater stops gracefully before the hard timeout)'
+        required: false
+        default: '300'
+        type: string
 
 jobs:
   update-futures-dataset:
     runs-on: ubuntu-latest
-    # Raise toward the GH Actions max so the script's soft MAX_RUNTIME_MIN
-    # budget (not the hard kill) ends each run and progress is uploaded.
+    # Hard timeout: GH Actions max is 360 min; leave buffer for squash + save.
     timeout-minutes: 350
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: "3.10"
 
@@ -31,19 +56,29 @@ jobs:
       - name: Install project dependencies
         run: poetry install
 
-      - name: Clone the dataset repository
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: git clone https://hf_user:${HF_TOKEN}@huggingface.co/datasets/linxy/USDT-M_Perpetual_Futures data
+      # ------------------------------------------------------------------
+      # Cache-aware HF repo setup
+      # ------------------------------------------------------------------
+      - name: Setup dataset repository
+        id: dataset-repo
+        uses: ./.github/actions/hf-repo-setup
+        with:
+          hf_token: ${{ secrets.HF_TOKEN }}
+          repo_slug: linxy/USDT-M_Perpetual_Futures
+          data_dir: data
 
+      # ------------------------------------------------------------------
+      # Run the futures updater with periodic auto-push (checkpoints)
+      # ------------------------------------------------------------------
       - name: Run the futures dataset update script with retries
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          MAX_RUNTIME_MIN: "300"
-          FETCH_WORKERS: "64"
-          PUSH_INTERVAL_SEC: "60"
+          MAX_RUNTIME_MIN: ${{ inputs.max_runtime_min || '300' }}
+          FETCH_WORKERS: ${{ inputs.fetch_workers || '64' }}
+          PUSH_INTERVAL_SEC: ${{ inputs.push_interval_sec || '60' }}
+          BATCH_TOTAL: ${{ inputs.batch_total || '1' }}
+          BATCH_INDEX: ${{ inputs.batch_index || '0' }}
           PYTHONUNBUFFERED: "1"
-          # The script defaults PROXY to a local dev proxy; disable it on CI.
           PROXY: ""
         run: |
           max_retries=5
@@ -58,6 +93,9 @@ jobs:
             sleep 30
           done
 
+      # ------------------------------------------------------------------
+      # Generate run summary (always, even on failure)
+      # ------------------------------------------------------------------
       - name: Generate run summary
         if: always()
         run: |
@@ -66,9 +104,11 @@ jobs:
           import json
           with open('output/run_summary.json') as f:
               s = json.load(f)
-          print('# USDT-M Perpetual Futures — Run Summary', file=open('output/summary.md','w'))
+          # Include batch info in summary for traceability
+          print(f'# USDT-M Perpetual Futures — Run Summary', file=open('output/summary.md','w'))
           print(f'| Item | Value |', file=open('output/summary.md','a'))
           print(f'|------|-------|', file=open('output/summary.md','a'))
+          print(f'| Batch | {s.get(\"batch_index\",0)} / {s.get(\"batch_total\",1)} |', file=open('output/summary.md','a'))
           print(f'| Start | {s[\"start_time\"]} |', file=open('output/summary.md','a'))
           print(f'| End | {s[\"end_time\"]} |', file=open('output/summary.md','a'))
           print(f'| Elapsed | {s[\"elapsed_seconds\"]}s ({s[\"budget_limit_min\"]}min budget) |', file=open('output/summary.md','a'))
@@ -77,7 +117,7 @@ jobs:
           print(f'| Symbols updated | {s[\"symbols_updated\"]} |', file=open('output/summary.md','a'))
           print(f'| Remaining (next run) | {s[\"remaining\"]} |', file=open('output/summary.md','a'))
           print('', file=open('output/summary.md','a'))
-          if s['per_symbol']:
+          if s.get('per_symbol'):
               print('### Updated symbols', file=open('output/summary.md','a'))
               print('| Symbol | Updated | Failed |', file=open('output/summary.md','a'))
               print('|--------|---------|--------|', file=open('output/summary.md','a'))
@@ -89,19 +129,57 @@ jobs:
             echo "No run_summary.json found — updater may not have run." >> $GITHUB_STEP_SUMMARY
           fi
 
+      # ------------------------------------------------------------------
+      # Squash history — only the master batch squashes to avoid races
+      # ------------------------------------------------------------------
       - name: Squash dataset repository history to a single commit
+        if: always() && steps.dataset-repo.outcome == 'success'
         working-directory: data
+        env:
+          BATCH_INDEX: ${{ inputs.batch_index || '0' }}
+          BATCH_TOTAL: ${{ inputs.batch_total || '1' }}
         run: |
           set -e
+
+          # Only the master batch (index 0) performs the squash.
+          # Non-master batches skip — their data is already on remote
+          # via auto-push during the run.
+          if [ "${BATCH_INDEX:-0}" != "0" ] && [ "${BATCH_TOTAL:-1}" != "1" ]; then
+            echo "Batch $BATCH_INDEX/$BATCH_TOTAL — skipping squash (master batch only)"
+            exit 0
+          fi
+
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
+
+          # Pull latest from remote to include all parallel runs' commits.
+          git fetch origin main --quiet
+          git reset --hard "origin/main"
+
           BRANCH=$(git rev-parse --abbrev-ref HEAD)
-          git fetch origin "$BRANCH"
-          git reset --hard "origin/$BRANCH"
           BEFORE_SHA=$(git rev-parse HEAD)
+
+          # If only one commit (or orphan root), skip squash.
+          ROOT_SHA=$(git rev-list --max-parents=0 HEAD 2>/dev/null || echo "")
+          COMMIT_COUNT=$(git rev-list --count "$ROOT_SHA..HEAD" 2>/dev/null || echo "1")
+          if [ "${COMMIT_COUNT:-1}" -le 1 ]; then
+            echo "Single commit — squash not needed (HEAD=$BEFORE_SHA)"
+            exit 0
+          fi
+
           git checkout --orphan squash-tmp
           git add -A
-          git commit -m "Squash history to reduce repository size (was ${BEFORE_SHA}, $(date -u +%Y-%m-%dT%H:%M:%SZ))"
+          git commit -m "Squash history — was ${BEFORE_SHA}, $(date -u +%Y-%m-%dT%H:%M:%SZ)"
           git branch -D "$BRANCH"
           git branch -m "$BRANCH"
           git push origin "$BRANCH" --force-with-lease="$BRANCH:$BEFORE_SHA"
+
+      # ------------------------------------------------------------------
+      # Save the cache for the next run
+      # ------------------------------------------------------------------
+      - name: Save dataset cache
+        if: always() && steps.dataset-repo.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: data
+          key: linxy/USDT-M_Perpetual_Futures
