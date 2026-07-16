@@ -53,24 +53,16 @@ merge_safe_pull() {
         return 0
     fi
 
-    log "Pulling latest from origin (with local changes)…"
-    if git -C "$DATA_DIR" pull --rebase origin main 2>&1; then
-        log "Pull OK"
-        return 0
-    fi
-
-    # Rebase conflict: stash → reset → pull → pop
-    log "WARNING: pull --rebase had conflicts — resolving via stash"
+    # Dirty tree (unstaged .gitattributes from LFS, new CSV files, etc.).
+    # pull --rebase would fail — go straight to stash + reset + pop.
+    log "Pulling latest from origin (dirty tree — stash + reset + pop)…"
     git -C "$DATA_DIR" stash --include-untracked 2>/dev/null || true
     git -C "$DATA_DIR" fetch origin main --quiet
     git -C "$DATA_DIR" reset --hard origin/main
     if git -C "$DATA_DIR" stash pop 2>/dev/null; then
-        log "Stash popped cleanly after reset"
+        log "Stash popped cleanly"
     else
-        # Stash pop may have merge conflicts in the working tree —
-        # that's OK, the files are there; the Python updater will
-        # reconcile via load_index() + save_index() merge logic.
-        log "Stash pop had conflicts (files are in working tree — updater will reconcile)"
+        log "Stash pop had conflicts (files preserved — updater will reconcile)"
         git -C "$DATA_DIR" checkout --theirs . 2>/dev/null || true
         git -C "$DATA_DIR" reset HEAD . 2>/dev/null || true
     fi
@@ -107,9 +99,9 @@ lfs_ensure() {
 
 # ---------------------------------------------------------------------------
 # push_progress — the core checkpoint routine.
-#   1. Pull latest (merge-safe — handles parallel runs)
-#   2. LFS setup
-#   3. Stage everything
+#   1. LFS setup
+#   2. Stage everything
+#   3. Pull latest (merge-safe — handles parallel runs)
 #   4. Commit + push
 #   5. On push conflict (another run pushed first):
 #      undo commit → stash → pull → pop → recommit → push (up to 3 retries)
@@ -122,19 +114,19 @@ push_progress() {
         return 0
     fi
 
-    # 1. Sync with remote first (so index merges don't get lost)
-    merge_safe_pull
-
-    # 2. LFS tracking
+    # 1. LFS tracking
     lfs_ensure
 
-    # 3. Stage everything
+    # 2. Stage everything
     git -C "$DATA_DIR" add -A
 
     if [ -z "$(git -C "$DATA_DIR" status --porcelain)" ]; then
         log "No changes to push."
         return 0
     fi
+
+    # 3. Sync with remote (stash → fetch → reset → pop — handles dirty tree)
+    merge_safe_pull
 
     # 4. Commit
     local commit_msg="auto-save $(date -u +%Y-%m-%dT%H:%M:%SZ)"
