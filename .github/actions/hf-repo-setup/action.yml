@@ -1,0 +1,95 @@
+name: 'HF Dataset Repo Setup'
+description: >
+  Cache-aware setup of a HuggingFace dataset repository clone.
+  Restores the data/ directory from GitHub Actions cache on hit
+  (with git fetch + reset --hard to sync), or does a fresh clone
+  on miss.  Handles squashed history transparently via reset --hard.
+inputs:
+  hf_token:
+    description: 'HuggingFace API token (read/write)'
+    required: true
+  repo_slug:
+    description: 'HF dataset slug (e.g. linxy/CryptoCoin)'
+    required: true
+  data_dir:
+    description: 'Target directory for the clone'
+    required: false
+    default: 'data'
+outputs:
+  cache_hit:
+    description: 'Whether the cache was restored (true) or we did a fresh clone (false)'
+    value: ${{ steps.cache-restore.outputs.cache-hit }}
+
+runs:
+  using: 'composite'
+  steps:
+    # ------------------------------------------------------------------
+    # 1. Try to restore the cached data/ directory
+    # ------------------------------------------------------------------
+    - name: Restore HF dataset from cache
+      id: cache-restore
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ inputs.data_dir }}
+        key: ${{ inputs.repo_slug }}
+        restore-keys: |
+          ${{ inputs.repo_slug }}-
+
+    # ------------------------------------------------------------------
+    # 2. Cache HIT — sync local clone with remote (handles squash)
+    # ------------------------------------------------------------------
+    - name: Sync cached repo with remote
+      if: steps.cache-restore.outputs.cache-hit == 'true'
+      shell: bash
+      run: |
+        echo "::group::Restoring dataset from cache — syncing with remote"
+        cd "${{ inputs.data_dir }}"
+
+        # Point remote at HF (the cached clone may have been created on
+        # a different runner / different session).
+        git remote set-url origin \
+          "https://hf_user:${{ inputs.hf_token }}@huggingface.co/datasets/${{ inputs.repo_slug }}" \
+          2>/dev/null || git remote add origin \
+          "https://hf_user:${{ inputs.hf_token }}@huggingface.co/datasets/${{ inputs.repo_slug }}"
+
+        # ---- rescue uncommitted data from a killed previous run ----
+        # If the last workflow was killed mid-run, the cache may contain
+        # uncommitted CSV updates (written by the Python updater but never
+        # auto-pushed before the kill).  Auto-commit + push them first so
+        # the data is not lost.
+        if [ -n "$(git status --porcelain)" ]; then
+          echo "⚠ Found uncommitted changes from previous (killed?) run — rescuing"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add -A
+          git commit -m "rescue uncommitted data from interrupted run ($(date -u +%Y-%m-%dT%H:%M:%SZ))" || true
+          git push origin main 2>/dev/null || echo "(push failed — will reconcile below)"
+        fi
+
+        # fetch + reset --hard handles:
+        #  - normal fast-forward
+        #  - squashed history (force-pushed orphan commit)
+        #  - parallel runs that pushed new data after our last save
+        git fetch origin main --quiet
+        git reset --hard "origin/main"
+
+        # Clean only truly orphaned files (ignores tracked modifications
+        # that were already rescued above).
+        git clean -fd
+
+        echo "✅ Cache hit — repo synced to $(git rev-parse --short HEAD)"
+        echo "::endgroup::"
+
+    # ------------------------------------------------------------------
+    # 3. Cache MISS — fresh clone
+    # ------------------------------------------------------------------
+    - name: Clone dataset repo (cache miss)
+      if: steps.cache-restore.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        echo "::group::Cache miss — cloning fresh"
+        git clone \
+          "https://hf_user:${{ inputs.hf_token }}@huggingface.co/datasets/${{ inputs.repo_slug }}" \
+          "${{ inputs.data_dir }}"
+        echo "✅ Fresh clone created at $(cd "${{ inputs.data_dir }}" && git rev-parse --short HEAD)"
+        echo "::endgroup::"
