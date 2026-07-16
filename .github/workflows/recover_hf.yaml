@@ -1,0 +1,18 @@
+name: Recover HF Repo (reset HEAD~1)
+on: workflow_dispatch
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Clone + reset
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          git clone --depth 2 "https://hf_user:${HF_TOKEN}@huggingface.co/datasets/linxy/USDT-M_Perpetual_Futures" data
+          cd data
+          echo "Before: $(git log --oneline -3)"
+          git reset --hard HEAD~1
+          echo "After:  $(git log --oneline -3)"
+          git push origin main --force
+          echo "Done"
