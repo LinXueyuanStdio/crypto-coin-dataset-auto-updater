@@ -177,9 +177,11 @@ jobs:
       # ------------------------------------------------------------------
       # Save the cache for the next run
       # ------------------------------------------------------------------
-      - name: Save dataset cache
+      - name: Save dataset caches
         if: always() && steps.dataset-repo.outcome == 'success'
-        uses: actions/cache/save@v4
+        uses: ./.github/actions/hf-repo-setup
         with:
-          path: data
-          key: linxy/USDT-M_Perpetual_Futures
+          mode: save
+          hf_token: ${{ secrets.HF_TOKEN }}
+          repo_slug: linxy/USDT-M_Perpetual_Futures
+          data_dir: data

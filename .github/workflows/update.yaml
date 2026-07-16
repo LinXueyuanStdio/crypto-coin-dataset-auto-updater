@@ -107,11 +107,13 @@ jobs:
           git push origin "$BRANCH" --force-with-lease="$BRANCH:$BEFORE_SHA"
 
       # ------------------------------------------------------------------
-      # Save the cache for the next run (always, even if earlier steps fail)
+      # Save caches for the next run (.git + per-symbol data, via action)
       # ------------------------------------------------------------------
-      - name: Save dataset cache
+      - name: Save dataset caches
         if: always() && steps.dataset-repo.outcome == 'success'
-        uses: actions/cache/save@v4
+        uses: ./.github/actions/hf-repo-setup
         with:
-          path: data
-          key: linxy/CryptoCoin
+          mode: save
+          hf_token: ${{ secrets.HF_TOKEN }}
+          repo_slug: linxy/CryptoCoin
+          data_dir: data
