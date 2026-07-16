@@ -35,12 +35,13 @@ jobs:
           data_dir: data
 
       - name: Install dependencies for migration
-        run: pip install pandas pyarrow
+        run: pip install pandas pyarrow huggingface_hub
 
       - name: Reorganize + convert to Parquet
         working-directory: data
         env:
           DATASET_SLUG: ${{ inputs.dataset_slug }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           set -e
           git config user.email "migration-bot[bot]@users.noreply.github.com"
@@ -107,7 +108,7 @@ jobs:
           from huggingface_hub import HfApi, CommitOperationAdd, CommitOperationDelete
 
           api = HfApi(token=os.environ['HF_TOKEN'])
-          repo = 'linxy/USDT-M_Perpetual_Futures'
+          repo = os.environ['DATASET_SLUG']
           ops = []
 
           # (a) Delete old flat CSV files from repo root
