@@ -6,24 +6,26 @@ on:
     - cron: "0 0 * * *"
   # Allows manual triggering via the "Actions" tab
   workflow_dispatch:
+    inputs:
+      fetch_workers:
+        description: 'Number of parallel fetch workers'
+        required: false
+        default: '16'
+        type: string
 
 jobs:
   update-dataset:
     runs-on: ubuntu-latest
-    # GitHub Actions defaults to a 360-minute (6h) job timeout, after which the
-    # job is silently cancelled. Set an explicit timeout so that a stuck run
-    # (e.g. Binance API unreachable) fails clearly and quickly
-    # instead of running for hours with no useful signal.
     timeout-minutes: 120
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.10" # Or your required version
+          python-version: "3.10"
 
       - name: Install Poetry
         run: pip install poetry
@@ -34,18 +36,26 @@ jobs:
       - name: Install project dependencies
         run: poetry install
 
-      - name: Clone the dataset repository
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: git clone https://hf_user:${HF_TOKEN}@huggingface.co/datasets/linxy/CryptoCoin data
+      # ------------------------------------------------------------------
+      # Cache-aware HF repo setup
+      # ------------------------------------------------------------------
+      - name: Setup dataset repository
+        id: dataset-repo
+        uses: ./.github/actions/hf-repo-setup
+        with:
+          hf_token: ${{ secrets.HF_TOKEN }}
+          repo_slug: linxy/CryptoCoin
+          data_dir: data
 
+      # ------------------------------------------------------------------
+      # Run the updater
+      # ------------------------------------------------------------------
       - name: Run the dataset update script with retries
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
           BINANCE_API_SECRET: ${{ secrets.BINANCE_API_SECRET }}
-          # Ensure Python logs are flushed immediately instead of being
-          # buffered, so timestamps in the Actions log reflect reality.
+          FETCH_WORKERS: ${{ inputs.fetch_workers || '16' }}
           PYTHONUNBUFFERED: "1"
         run: |
           max_retries=5
@@ -60,27 +70,48 @@ jobs:
             sleep 30
           done
 
+      # ------------------------------------------------------------------
+      # Squash history to keep the HF repo compact
+      # ------------------------------------------------------------------
       - name: Squash dataset repository history to a single commit
+        if: always() && steps.dataset-repo.outcome == 'success'
         working-directory: data
         run: |
           set -e
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
 
-          # Make sure we have the latest commit that was just pushed by the update script
+          # Pull latest in case the updater pushed, then another parallel
+          # run pushed after us (race between updater exit and squash).
+          git fetch origin main --quiet
+          git reset --hard "origin/main"
+
           BRANCH=$(git rev-parse --abbrev-ref HEAD)
-          git fetch origin "$BRANCH"
-          git reset --hard "origin/$BRANCH"
           BEFORE_SHA=$(git rev-parse HEAD)
 
-          # Recreate the branch with a single commit containing the current state
+          # If only one commit in this run, skip squash (nothing to do).
+          ROOT_SHA=$(git rev-list --max-parents=0 HEAD)
+          if [ "$(git rev-list --count "$ROOT_SHA..HEAD")" -le 1 ]; then
+            echo "Single commit — squash not needed (HEAD=$BEFORE_SHA)"
+            exit 0
+          fi
+
           git checkout --orphan squash-tmp
           git add -A
-          git commit -m "Squash history to reduce repository size (was ${BEFORE_SHA}, $(date -u +%Y-%m-%dT%H:%M:%SZ))"
+          git commit -m "Squash history — was ${BEFORE_SHA}, $(date -u +%Y-%m-%dT%H:%M:%SZ)"
           git branch -D "$BRANCH"
           git branch -m "$BRANCH"
 
-          # Force-push the squashed history, discarding all previous commits.
-          # --force-with-lease guards against overwriting commits pushed by
-          # another process after our fetch above.
+          # --force-with-lease guards against overwriting commits pushed
+          # by another process after our fetch above.
           git push origin "$BRANCH" --force-with-lease="$BRANCH:$BEFORE_SHA"
+
+      # ------------------------------------------------------------------
+      # Save the cache for the next run (always, even if earlier steps fail)
+      # ------------------------------------------------------------------
+      - name: Save dataset cache
+        if: always() && steps.dataset-repo.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: data
+          key: linxy/CryptoCoin
