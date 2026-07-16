@@ -135,13 +135,59 @@ runs:
         key: ${{ inputs.cache_prefix || inputs.repo_slug }}-git${{ inputs.cache_suffix }}
 
     # ==================================================================
-    # SAVE — per-symbol data folders
+    # SAVE — per-symbol data folders, budget-aware
+    #
+    #   Budget: 9 GB total (1 GB buffer under the 10 GB limit).
+    #   Symbols sorted alphabetically → greedy inclusion until the
+    #   next symbol would exceed budget.  Deterministic & idempotent.
     # ==================================================================
-    - name: Save symbol caches
+    - name: Compute data cache budget
       if: inputs.mode == 'save'
+      id: compute-data-paths
+      shell: bash
+      run: |
+        DATA_DIR="${{ inputs.data_dir }}"
+        BUDGET_MB=9000   # 9 GB
+
+        # Reserve space for .git (may already be cached separately)
+        if [ -d "$DATA_DIR/.git" ]; then
+          GIT_SIZE_MB=$(du -sm "$DATA_DIR/.git" 2>/dev/null | cut -f1)
+          AVAIL_MB=$((BUDGET_MB - GIT_SIZE_MB))
+        else
+          AVAIL_MB=$BUDGET_MB
+        fi
+        echo "Git size: ${GIT_SIZE_MB:-0} MB  |  Available for data: $AVAIL_MB MB"
+
+        cumul=0
+        included=""
+        for dir in $(ls -1d "$DATA_DIR"/*/ 2>/dev/null | sort); do
+          sz=$(du -sm "$dir" 2>/dev/null | cut -f1)
+          next=$((cumul + sz))
+          if [ "$next" -le "$AVAIL_MB" ]; then
+            cumul=$next
+            included="$included"$'\n'"$dir"
+            echo "  + $(basename "$dir")  ${sz}MB  (total ${cumul}MB)"
+          else
+            echo "  SKIP $(basename "$dir")  ${sz}MB  (would be ${next}MB > ${AVAIL_MB}MB)"
+          fi
+        done
+
+        if [ -z "$included" ]; then
+          echo "⚠ No symbol folders fit in budget — skipping data cache"
+          echo "paths=" >> "$GITHUB_OUTPUT"
+          echo "empty=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "paths<<PATHS" >> "$GITHUB_OUTPUT"
+          echo "$included" >> "$GITHUB_OUTPUT"
+          echo "PATHS" >> "$GITHUB_OUTPUT"
+          echo "empty=false" >> "$GITHUB_OUTPUT"
+          echo "Cached $(echo "$included" | wc -l) symbol(s), ${cumul}MB total"
+        fi
+
+    - name: Save symbol caches
+      if: inputs.mode == 'save' && steps.compute-data-paths.outputs.empty != 'true'
       id: save-symbols
       uses: actions/cache/save@v4
       with:
-        path: |
-          ${{ inputs.data_dir }}/*/
+        path: ${{ steps.compute-data-paths.outputs.paths }}
         key: ${{ inputs.cache_prefix || inputs.repo_slug }}-data${{ inputs.cache_suffix }}
