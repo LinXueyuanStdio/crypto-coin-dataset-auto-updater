@@ -46,7 +46,14 @@ runs:
           2>/dev/null || git remote add origin \
           "https://hf_user:${{ inputs.hf_token }}@huggingface.co/datasets/${{ inputs.repo_slug }}"
 
-        git fetch origin main --quiet
+        # Retry fetch — HF occasionally returns 5xx which git can't parse
+        for attempt in 1 2 3; do
+          if GIT_LFS_SKIP_SMUDGE=1 git fetch origin main --quiet 2>&1; then
+            break
+          fi
+          echo "Fetch attempt $attempt/3 failed, retrying in $((attempt * 10))s…"
+          sleep $((attempt * 10))
+        done
         git reset --hard "origin/main"
         echo "✅ Synced — HEAD=$(git rev-parse --short HEAD)"
         du -sh . 2>/dev/null || true
