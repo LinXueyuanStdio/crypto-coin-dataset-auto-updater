@@ -19,7 +19,7 @@ on:
 jobs:
   rebuild:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 360
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -33,7 +33,7 @@ jobs:
         run: pip install pandas pyarrow huggingface_hub
 
       # ------------------------------------------------------------------
-      # Clone
+      # Full clone — needs actual parquet data, not LFS pointers
       # ------------------------------------------------------------------
       - name: Clone dataset
         env:
@@ -41,7 +41,7 @@ jobs:
         run: |
           set -e
           URL="https://hf_user:${HF_TOKEN}@huggingface.co/datasets/${{ inputs.dataset_slug }}"
-          GIT_LFS_SKIP_SMUDGE=1 git clone "$URL" data
+          git clone "$URL" data
           cd data
           git config user.email "actions[bot]@users.noreply.github.com"
           git config user.name "actions[bot]"
@@ -65,17 +65,10 @@ jobs:
               'metrics': 'create_time',
               'fundingRate': 'calc_time',
           }
-          FLOORS = {
-              'klines': '2020-01',
-              'markPrice': '2020-01',
-              'indexPrice': '2020-01',
-              'premiumIndex': '2020-01',
-              'metrics': '2021-01',
-              'fundingRate': '2020-01',
-          }
 
           idx = {}
           total = 0
+          errors = 0
           t0 = time.monotonic()
           for root, dirs, files in os.walk('.'):
               if '.git' in root.split(os.sep):
@@ -88,7 +81,9 @@ jobs:
                   try:
                       df = pd.read_parquet(fp)
                   except Exception as e:
-                      print(f'  SKIP {fp}: {e}')
+                      errors += 1
+                      if errors <= 10:
+                          print(f'  SKIP {fp}: {e}')
                       continue
 
                   base = Path(f).stem
@@ -118,13 +113,11 @@ jobs:
 
           with open('_index.json', 'w', encoding='utf-8') as out:
               json.dump(idx, out, indent=0, sort_keys=True, ensure_ascii=False)
-          print(f'Index rebuild done: {len(idx)}/{total} files in {time.monotonic()-t0:.0f}s')
+          print(f'Index rebuild done: {len(idx)}/{total} files ({errors} errors) in {time.monotonic()-t0:.0f}s')
           " 2>&1
 
       # ------------------------------------------------------------------
       # 2. Validate data completeness
-      #    - computes earliest / latest / span per file
-      #    - flags files spanning < min_span_days where earliest is suspiciously recent
       # ------------------------------------------------------------------
       - name: Validate data completeness
         working-directory: data
@@ -140,7 +133,7 @@ jobs:
           echo ""
 
           python3 -c "
-          import os, json, sys, time
+          import os, json, sys
           from pathlib import Path
           import pandas as pd
 
@@ -176,7 +169,6 @@ jobs:
                   fp = os.path.join(root, f).lstrip('./')
                   total += 1
 
-                  # Resolve time column and expected floor
                   base = Path(f).stem
                   if 'markPrice' in base:
                       dt_key, floor = 'markPrice', '2020-01'
@@ -196,7 +188,7 @@ jobs:
                   try:
                       df = pd.read_parquet(fp, columns=[time_col])
                   except Exception as e:
-                      suspicious.append((fp, dt_key, floor, None, None, 0, f'(read error: {e})'))
+                      suspicious.append((fp, dt_key, floor, None, None, 0, f'read error: {e}'))
                       continue
 
                   if df.empty or time_col not in df.columns:
@@ -218,7 +210,7 @@ jobs:
                       if earliest >= floor_dt + pd.DateOffset(years=1):
                           suspicious.append((fp, dt_key, floor, earliest, latest, span_days, ''))
                       else:
-                          ok += 1  # old file, legitimately short span
+                          ok += 1
                   else:
                       ok += 1
 
@@ -269,7 +261,7 @@ jobs:
               api = HfApi(token=os.environ.get('HF_TOKEN'))
               ops = []
               for row in suspicious:
-                  fp = row[0]; dt_key = row[1]; earliest = row[3]; span_days = row[5]
+                  fp = row[0]; earliest = row[3]; span_days = row[5]
                   if earliest is None:
                       print(f'  SKIP {fp} (read error, cannot delete)')
                       continue
@@ -303,13 +295,11 @@ jobs:
           echo ""
           echo "::endgroup::"
 
-          # Fail the step if incomplete files found (alert operator)
           INCOMPLETE_COUNT=$(python3 -c "
-          import json, os
-          if os.path.exists('output/completeness_report.md'):
-              with open('output/completeness_report.md') as f:
+          import os, re
+          if os.path.exists('../output/completeness_report.md'):
+              with open('../output/completeness_report.md') as f:
                   text = f.read()
-              import re
               m = re.search(r'Incomplete files found: \*\*(\d+)\*\*', text)
               print(m.group(1) if m else 0)
           else:
