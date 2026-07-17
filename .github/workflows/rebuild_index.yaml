@@ -1,6 +1,20 @@
-name: Rebuild _index.json from Parquet files
+name: Rebuild _index.json + Validate Data Completeness
 
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+    inputs:
+      dataset_slug:
+        description: 'HF dataset slug'
+        required: false
+        default: 'linxy/USDT-M_Perpetual_Futures'
+      min_span_days:
+        description: 'Flag files spanning fewer than this many days (0 = skip check)'
+        required: false
+        default: '30'
+      delete_incomplete:
+        description: 'Delete incomplete parquet files + index entries to trigger re-fetch?'
+        required: false
+        default: 'false'
 
 jobs:
   rebuild:
@@ -18,12 +32,23 @@ jobs:
       - name: Install dependencies
         run: pip install pandas pyarrow huggingface_hub
 
+      # ------------------------------------------------------------------
+      # Clone
+      # ------------------------------------------------------------------
       - name: Clone dataset
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          git clone "https://hf_user:${HF_TOKEN}@huggingface.co/datasets/linxy/USDT-M_Perpetual_Futures" data
+          set -e
+          URL="https://hf_user:${HF_TOKEN}@huggingface.co/datasets/${{ inputs.dataset_slug }}"
+          git clone "$URL" data
+          cd data
+          git config user.email "actions[bot]@users.noreply.github.com"
+          git config user.name "actions[bot]"
 
+      # ------------------------------------------------------------------
+      # 1. Rebuild _index.json from actual Parquet files
+      # ------------------------------------------------------------------
       - name: Rebuild _index.json
         working-directory: data
         run: |
@@ -32,7 +57,6 @@ jobs:
           from pathlib import Path
           import pandas as pd
 
-          DATA_TYPES_KLINE = ['klines', 'markPrice', 'indexPrice', 'premiumIndex']
           TIME_COLS = {
               'klines': 'open_time',
               'markPrice': 'open_time',
@@ -40,6 +64,14 @@ jobs:
               'premiumIndex': 'open_time',
               'metrics': 'create_time',
               'fundingRate': 'calc_time',
+          }
+          FLOORS = {
+              'klines': '2020-01',
+              'markPrice': '2020-01',
+              'indexPrice': '2020-01',
+              'premiumIndex': '2020-01',
+              'metrics': '2021-01',
+              'fundingRate': '2020-01',
           }
 
           idx = {}
@@ -59,7 +91,6 @@ jobs:
                       print(f'  SKIP {fp}: {e}')
                       continue
 
-                  # Guess time column from filename
                   base = Path(f).stem
                   if 'markPrice' in base:
                       time_col = 'open_time'
@@ -78,17 +109,205 @@ jobs:
                       print(f'  SKIP {fp}: no column {time_col}')
                       continue
 
-                  ts = pd.to_datetime(df[time_col], errors='coerce').max()
-                  if pd.notna(ts):
-                      idx[fp] = ts.strftime('%Y-%m-%d %H:%M:%S')
+                  ts = pd.to_datetime(df[time_col], errors='coerce')
+                  ts_max = ts.max()
+                  if pd.notna(ts_max):
+                      idx[fp] = ts_max.strftime('%Y-%m-%d %H:%M:%S')
                   if total % 500 == 0:
                       print(f'  [{total}] scanned …', flush=True)
 
           with open('_index.json', 'w', encoding='utf-8') as out:
               json.dump(idx, out, indent=0, sort_keys=True, ensure_ascii=False)
-          print(f'Done: {len(idx)}/{total} files indexed in {time.monotonic()-t0:.0f}s')
+          print(f'Index rebuild done: {len(idx)}/{total} files in {time.monotonic()-t0:.0f}s')
           " 2>&1
 
+      # ------------------------------------------------------------------
+      # 2. Validate data completeness
+      #    - computes earliest / latest / span per file
+      #    - flags files spanning < min_span_days where earliest is suspiciously recent
+      # ------------------------------------------------------------------
+      - name: Validate data completeness
+        working-directory: data
+        env:
+          MIN_SPAN_DAYS: ${{ inputs.min_span_days || '30' }}
+          DELETE_INCOMPLETE: ${{ inputs.delete_incomplete || 'false' }}
+        run: |
+          MIN_SPAN_DAYS="${MIN_SPAN_DAYS:-30}"
+          DELETE_INCOMPLETE="${DELETE_INCOMPLETE:-false}"
+
+          echo "::group::Completeness check (min_span=${MIN_SPAN_DAYS}d)"
+          echo ""
+
+          python3 -c "
+          import os, json, sys, time
+          from pathlib import Path
+          import pandas as pd
+
+          MIN_SPAN = int(os.environ.get('MIN_SPAN_DAYS', '30'))
+          DELETE = os.environ.get('DELETE_INCOMPLETE', 'false').lower() == 'true'
+
+          if MIN_SPAN <= 0:
+              print('MIN_SPAN_DAYS=0 — skipping completeness check')
+              sys.exit(0)
+
+          TIME_COLS = {
+              'klines': 'open_time', 'markPrice': 'open_time',
+              'indexPrice': 'open_time', 'premiumIndex': 'open_time',
+              'metrics': 'create_time', 'fundingRate': 'calc_time',
+          }
+          FLOORS = {
+              'klines': '2020-01', 'markPrice': '2020-01',
+              'indexPrice': '2020-01', 'premiumIndex': '2020-01',
+              'metrics': '2021-01', 'fundingRate': '2020-01',
+          }
+
+          suspicious = []
+          ok = 0
+          total = 0
+
+          for root, dirs, files in os.walk('.'):
+              if '.git' in root.split(os.sep):
+                  continue
+              for f in sorted(files):
+                  if not f.endswith('.parquet'):
+                      continue
+                  fp = os.path.join(root, f).lstrip('./')
+                  total += 1
+
+                  # Resolve time column and expected floor
+                  base = Path(f).stem
+                  if 'markPrice' in base:
+                      dt_key, floor = 'markPrice', '2020-01'
+                  elif 'indexPrice' in base:
+                      dt_key, floor = 'indexPrice', '2020-01'
+                  elif 'premiumIndex' in base:
+                      dt_key, floor = 'premiumIndex', '2020-01'
+                  elif 'metrics' in base:
+                      dt_key, floor = 'metrics', '2021-01'
+                  elif 'fundingRate' in base:
+                      dt_key, floor = 'fundingRate', '2020-01'
+                  else:
+                      dt_key, floor = 'klines', '2020-01'
+
+                  time_col = TIME_COLS[dt_key]
+
+                  try:
+                      df = pd.read_parquet(fp, columns=[time_col])
+                  except Exception as e:
+                      suspicious.append((fp, dt_key, f'(read error: {e})'))
+                      continue
+
+                  if df.empty or time_col not in df.columns:
+                      continue
+
+                  ts = pd.to_datetime(df[time_col], errors='coerce')
+                  earliest = ts.min()
+                  latest = ts.max()
+
+                  if pd.isna(earliest) or pd.isna(latest):
+                      continue
+
+                  span_days = (latest - earliest).days
+                  flag = ''
+
+                  if span_days < MIN_SPAN:
+                      # Only flag if the earliest data is suspiciously recent
+                      # (more than 1 year after the DataType floor)
+                      floor_dt = pd.Timestamp(floor + '-01')
+                      if earliest >= floor_dt + pd.DateOffset(years=1):
+                          flag = f'INCOMPLETE'
+                          suspicious.append((fp, dt_key, floor, earliest, latest, span_days))
+                      else:
+                          flag = f'short_span_but_old_enough'
+                  else:
+                      ok += 1
+
+                  if total % 500 == 0:
+                      print(f'  [{total}] checked … (ok={ok}, suspicious={len(suspicious)})', flush=True)
+
+          # ---- report ----
+          print(f'Total files checked: {total}')
+          print(f'OK (span >= {MIN_SPAN}d or pre-floor): {ok}')
+          print(f'Incomplete (span < {MIN_SPAN}d, earliest suspiciously recent): {len(suspicious)}')
+          print('')
+
+          if suspicious:
+              with open('../output/completeness_report.md', 'w') as out:
+               print('# Data Completeness Report', file=out)
+               print('', file=out)
+               print(f'Min span threshold: **{MIN_SPAN} days**', file=out)
+               print(f'Incomplete files found: **{len(suspicious)}**', file=out)
+               print('', file=out)
+               print('| File | Type | Floor | Earliest | Latest | Span |', file=out)
+               print('|------|------|-------|----------|--------|------|', file=out)
+               for fp, dt_key, floor, earliest, latest, span_days in sorted(suspicious):
+                   print(f'| {fp} | {dt_key} | {floor} | {earliest.date()} | {latest.date()} | {span_days}d |', file=out)
+              print('Completeness report saved to output/completeness_report.md')
+          else:
+              print('✅ All files pass completeness check')
+              with open('../output/completeness_report.md', 'w') as out:
+                  print('# Data Completeness Report', file=out)
+                  print(f'✅ All {total} files pass the {MIN_SPAN}-day span check.', file=out)
+
+          # ---- optionally delete incomplete files ----
+          if DELETE and suspicious:
+              from huggingface_hub import HfApi, CommitOperationDelete
+              api = HfApi(token=os.environ.get('HF_TOKEN'))
+              ops = []
+              for fp, dt_key, floor, earliest, latest, span_days in suspicious:
+                  ops.append(CommitOperationDelete(path_in_repo=fp))
+                  os.remove(fp) if os.path.exists(fp) else None
+                  print(f'  DELETE {fp} (span={span_days}d, earliest={earliest.date()})')
+              if ops:
+                  api.create_commit(
+                      repo_id='${{ inputs.dataset_slug }}',
+                      repo_type='dataset',
+                      commit_message=f'fix: delete {len(ops)} incomplete parquet files (span < {MIN_SPAN}d)',
+                      operations=ops,
+                  )
+                  print(f'{len(ops)} incomplete files deleted — next updater run will re-fetch from scratch')
+          elif DELETE and not suspicious:
+              print('No incomplete files to delete')
+
+          # ---- rebuild _index.json after deletion ----
+          if DELETE and suspicious:
+              print('Rebuilding _index.json after deletion …')
+              with open('_index.json') as f:
+                  idx = json.load(f)
+              removed = [fp for fp, *_ in suspicious if fp in idx]
+              for fp in removed:
+                  del idx[fp]
+              with open('_index.json', 'w', encoding='utf-8') as f:
+                  json.dump(idx, f, indent=0, sort_keys=True, ensure_ascii=False)
+              print(f'Removed {len(removed)} entries from _index.json')
+          " 2>&1
+
+          echo ""
+          echo "::endgroup::"
+
+          # Fail the step if incomplete files found (alert operator)
+          INCOMPLETE_COUNT=$(python3 -c "
+          import json, os
+          if os.path.exists('output/completeness_report.md'):
+              with open('output/completeness_report.md') as f:
+                  text = f.read()
+              import re
+              m = re.search(r'Incomplete files found: \*\*(\d+)\*\*', text)
+              print(m.group(1) if m else 0)
+          else:
+              print(0)
+          ")
+          if [ "$INCOMPLETE_COUNT" -gt 0 ] && [ "$DELETE_INCOMPLETE" != "true" ]; then
+              echo ""
+              echo "⚠️  ${INCOMPLETE_COUNT} incomplete file(s) found!"
+              echo "   Re-run with delete_incomplete=true to remove them and trigger re-fetch."
+              echo ""
+          fi
+          echo "Completeness check done ($INCOMPLETE_COUNT incomplete)"
+
+      # ------------------------------------------------------------------
+      # 3. Upload _index.json
+      # ------------------------------------------------------------------
       - name: Upload _index.json
         working-directory: data
         env:
@@ -98,7 +317,7 @@ jobs:
           from huggingface_hub import HfApi, CommitOperationAdd
           import os
           api = HfApi(token=os.environ['HF_TOKEN'])
-          repo = 'linxy/USDT-M_Perpetual_Futures'
+          repo = '${{ inputs.dataset_slug }}'
           api.create_commit(
               repo_id=repo,
               repo_type='dataset',
@@ -107,3 +326,13 @@ jobs:
           )
           print('_index.json uploaded')
           "
+
+      # ------------------------------------------------------------------
+      # 4. Show report
+      # ------------------------------------------------------------------
+      - name: Show completeness report
+        if: always()
+        run: |
+          if [ -f output/completeness_report.md ]; then
+            cat output/completeness_report.md >> $GITHUB_STEP_SUMMARY
+          fi

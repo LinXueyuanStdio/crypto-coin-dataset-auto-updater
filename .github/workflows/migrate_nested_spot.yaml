@@ -1,0 +1,157 @@
+name: Migrate CryptoCoin to Nested Per-Symbol Structure
+
+on:
+  workflow_dispatch:
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      # ------------------------------------------------------------------
+      # Clone (skip LFS blobs — migration converts CSV→Parquet locally)
+      # ------------------------------------------------------------------
+      - name: Clone dataset
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          set -e
+          URL="https://hf_user:${HF_TOKEN}@huggingface.co/datasets/linxy/CryptoCoin"
+
+          for attempt in 1 2 3; do
+            echo "Clone attempt $attempt/3 …"
+            if GIT_LFS_SKIP_SMUDGE=1 git clone "$URL" data 2>&1; then
+              echo "✅ Clone OK"
+              break
+            fi
+            echo "Failed, waiting $((attempt * 30))s…"
+            rm -rf data
+            sleep $((attempt * 30))
+          done
+          [ -d data ] || { echo "❌ Clone failed"; exit 1; }
+
+          cd data
+          git config user.email "migration-bot[bot]@users.noreply.github.com"
+          git config user.name "migration-bot[bot]"
+
+      - name: Install dependencies
+        run: pip install pandas pyarrow huggingface_hub
+
+      # ------------------------------------------------------------------
+      # Per-symbol migration (resumable — checks remote for remaining work)
+      # ------------------------------------------------------------------
+      - name: Migrate symbols one-by-one
+        working-directory: data
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          set -e
+
+          python3 -c "
+          import os, sys, json
+          from collections import defaultdict
+          from pathlib import Path
+          import pandas as pd
+          from huggingface_hub import HfApi, CommitOperationAdd, CommitOperationDelete
+
+          api = HfApi(token=os.environ['HF_TOKEN'])
+          repo = 'linxy/CryptoCoin'
+
+          # ---- find symbols that still need migration ----
+          files = api.list_repo_files(repo, repo_type='dataset')
+          flat_csvs = [f for f in files if f.endswith('.csv') and '/' not in f]
+          by_symbol = defaultdict(list)
+          for f in flat_csvs:
+              # Spot files: {symbol}_{interval}.csv (e.g. BTCUSDT_1d.csv)
+              # The interval part uses digits, extract symbol as everything
+              # before the interval pattern at the end.
+              parts = f.rsplit('_', 1)
+              if len(parts) == 2 and not parts[1].startswith('.'):
+                  by_symbol[parts[0]].append(f)
+              else:
+                  by_symbol[f.split('.')[0]].append(f)
+
+          if not by_symbol:
+              print('All symbols already migrated — nothing to do')
+              sys.exit(0)
+
+          symbols = sorted(by_symbol)
+          print(f'{len(symbols)} symbol(s) to migrate: {symbols}')
+
+          # ---- process in batches of 20 symbols ----
+          BATCH = 20
+          for batch_start in range(0, len(symbols), BATCH):
+              batch = symbols[batch_start:batch_start + BATCH]
+              ops = []
+              print(f'\n>>> Batch {batch_start // BATCH + 1}: {batch}')
+
+              for sym in batch:
+                  csvs = by_symbol[sym]
+                  print(f'  {sym} ({len(csvs)} files)')
+
+                  os.makedirs(sym, exist_ok=True)
+                  for csv in csvs:
+                      if os.path.exists(csv):
+                          os.rename(csv, os.path.join(sym, csv))
+
+                  # Convert CSV → Parquet, delete CSV
+                  for csv in csvs:
+                      csv_path = os.path.join(sym, csv)
+                      if not os.path.exists(csv_path):
+                          continue
+                      pq_path = str(Path(csv_path).with_suffix('.parquet'))
+                      df = pd.read_csv(csv_path, dtype=str)
+                      df.to_parquet(pq_path, index=False, compression='zstd')
+                      os.remove(csv_path)
+
+                  # Delete old flat CSVs + add new parquets
+                  for csv in csvs:
+                      ops.append(CommitOperationDelete(path_in_repo=csv))
+                  for f in sorted(os.listdir(sym)):
+                      fp = os.path.join(sym, f)
+                      ops.append(CommitOperationAdd(path_in_repo=fp, path_or_fileobj=fp))
+
+              print(f'  Committing {len(ops)} operations …')
+              api.create_commit(
+                  repo_id=repo,
+                  repo_type='dataset',
+                  commit_message=f'migrate: {len(batch)} symbols → nested Parquet',
+                  operations=ops,
+              )
+              print(f'  ✅ {len(batch)} symbol(s) done')
+
+              # Sync
+              os.system('git fetch origin main --quiet')
+              os.system('git reset --hard origin/main')
+
+          print(f'\n=== {len(symbols)} symbols migrated ===')
+
+          # ---- final: update _index.json paths ----
+          if os.path.exists('_index.json'):
+              with open('_index.json') as f:
+                  idx = json.load(f)
+              new_idx = {}
+              for old_key, ts in idx.items():
+                  parts = old_key.rsplit('_', 1)
+                  if len(parts) == 2 and parts[1].replace('.csv','').replace('.parquet','').isdigit():
+                      symbol = parts[0]
+                      name = old_key.replace('.csv', '.parquet')
+                  else:
+                      symbol = old_key.split('_')[0]
+                      name = old_key.replace('.csv', '.parquet')
+                  new_key = f'{symbol}/{name}'
+                  new_idx[new_key] = ts
+              with open('_index.json', 'w') as f:
+                  json.dump(new_idx, f, indent=0, sort_keys=True)
+              print(f'Updated {len(new_idx)} _index.json entries')
+          " 2>&1
+          echo "=== Migration complete ==="

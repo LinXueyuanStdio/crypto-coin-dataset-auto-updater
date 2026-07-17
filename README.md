@@ -8,11 +8,39 @@ Automatically update cryptocurrency datasets on Huggingface with Binance officia
 
 # 数据集使用方法
 
-数据文件格式：`{symbol}_{interval}.csv`，例如：`BTCUSDT_1d.csv`,`ETHUSDT_1h.csv`。
+数据文件格式：`{symbol}/{symbol}_{interval}.parquet`，例如：`BTCUSDT/BTCUSDT_1d.parquet`。
+
+## 快速下载（推荐）
+
+数据集包含大量币种和历史数据，完整下载体积很大。如果你只需要部分币种，可以跳过 LFS 文件下载，只拉取需要的：
+
+```bash
+# 只克隆元数据（不下载大文件），几秒完成
+GIT_LFS_SKIP_SMUDGE=1 git clone https://huggingface.co/datasets/linxy/CryptoCoin
+
+cd CryptoCoin
+
+# 只下载你需要的币种数据
+git lfs pull --include="BTCUSDT/**"
+git lfs pull --include="ETHUSDT/**"
+
+# 或者一次指定多个
+git lfs pull --include="BTCUSDT/**" --include="ETHUSDT/**" --include="SOLUSDT/**"
+```
+
+如果已有本地仓库，更新时同样可以跳过全量下载：
+
+```bash
+cd CryptoCoin
+GIT_LFS_SKIP_SMUDGE=1 git pull origin main
+git lfs pull --include="BTCUSDT/**"
+```
+
+## 使用 datasets 库加载
 
 ```python
 >>> from datasets import load_dataset
->>> dataset = load_dataset("linxy/CryptoCoin", data_files=["BTCUSDT_1d.csv"], split="train")
+>>> dataset = load_dataset("linxy/CryptoCoin", data_files=["BTCUSDT/BTCUSDT_1d.parquet"], split="train")
 >>> dataset
 Dataset({
     features: ['Open time', 'open', 'high', 'low', 'close', 'volume', 'Close time', 'Quote asset volume', 'Number of trades', 'Taker buy base asset volume', 'Taker buy quote asset volume', 'Ignore'],

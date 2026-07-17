@@ -100,6 +100,8 @@ jobs:
       - name: Run the futures dataset update script with retries
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          DATASET_SLUG: linxy/USDT-M_Perpetual_Futures
+          DATA_DIR: data
           MAX_RUNTIME_MIN: ${{ inputs.max_runtime_min || '300' }}
           FETCH_WORKERS: ${{ inputs.fetch_workers || '64' }}
           PUSH_INTERVAL_SEC: ${{ inputs.push_interval_sec || '60' }}
@@ -133,25 +135,25 @@ jobs:
           import json
           with open('output/run_summary.json') as f:
               s = json.load(f)
-          # Include batch info in summary for traceability
-          print(f'# USDT-M Perpetual Futures — Run Summary', file=open('output/summary.md','w'))
-          print(f'| Item | Value |', file=open('output/summary.md','a'))
-          print(f'|------|-------|', file=open('output/summary.md','a'))
-          print(f'| Batch | {s.get(\"batch_index\",0)} / {s.get(\"batch_total\",1)} |', file=open('output/summary.md','a'))
-          print(f'| Start | {s[\"start_time\"]} |', file=open('output/summary.md','a'))
-          print(f'| End | {s[\"end_time\"]} |', file=open('output/summary.md','a'))
-          print(f'| Elapsed | {s[\"elapsed_seconds\"]}s ({s[\"budget_limit_min\"]}min budget) |', file=open('output/summary.md','a'))
-          print(f'| Series produced | {s[\"produced\"]} |', file=open('output/summary.md','a'))
-          print(f'| Series failed | {s[\"failed\"]} |', file=open('output/summary.md','a'))
-          print(f'| Symbols updated | {s[\"symbols_updated\"]} |', file=open('output/summary.md','a'))
-          print(f'| Remaining (next run) | {s[\"remaining\"]} |', file=open('output/summary.md','a'))
-          print('', file=open('output/summary.md','a'))
-          if s.get('per_symbol'):
-              print('### Updated symbols', file=open('output/summary.md','a'))
-              print('| Symbol | Updated | Failed |', file=open('output/summary.md','a'))
-              print('|--------|---------|--------|', file=open('output/summary.md','a'))
-              for sym, info in sorted(s['per_symbol'].items()):
-                  print(f'| {sym} | {info[\"updated\"]} | {info[\"failed\"]} |', file=open('output/summary.md','a'))
+          with open('output/summary.md','w') as out:
+           print(f'# USDT-M Perpetual Futures — Run Summary', file=out)
+           print(f'| Item | Value |', file=out)
+           print(f'|------|-------|', file=out)
+           print(f'| Batch | {s.get(\"batch_index\",0)} / {s.get(\"batch_total\",1)} |', file=out)
+           print(f'| Start | {s.get(\"start_time\",\"?\")} |', file=out)
+           print(f'| End | {s.get(\"end_time\",\"?\")} |', file=out)
+           print(f'| Elapsed | {s.get(\"elapsed_seconds\",\"?\")}s ({s.get(\"budget_limit_min\",\"?\")}min budget) |', file=out)
+           print(f'| Series produced | {s.get(\"produced\",0)} |', file=out)
+           print(f'| Series failed | {s.get(\"failed\",0)} |', file=out)
+           print(f'| Symbols updated | {s.get(\"symbols_updated\",0)} |', file=out)
+           print(f'| Remaining (next run) | {s.get(\"remaining\",0)} |', file=out)
+           print('', file=out)
+           if s.get('per_symbol'):
+               print('### Updated symbols', file=out)
+               print('| Symbol | Updated | Failed |', file=out)
+               print('|--------|---------|--------|', file=out)
+               for sym, info in sorted(s['per_symbol'].items()):
+                   print(f'| {sym} | {info.get(\"updated\",0)} | {info.get(\"failed\",0)} |', file=out)
           " 2>&1
             cat output/summary.md >> $GITHUB_STEP_SUMMARY
           else

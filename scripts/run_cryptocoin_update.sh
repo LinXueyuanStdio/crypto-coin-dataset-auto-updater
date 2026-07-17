@@ -1,18 +1,17 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
-# run_futures_update.sh — wrapper that runs the Python futures updater and
-# periodically pushes partial progress to Hugging Face so that data is never
-# lost if the process is killed (CI timeout, OOM, etc.).
+# run_cryptocoin_update.sh — wrapper that runs the spot CryptoCoin updater and
+# periodically pushes partial progress to Hugging Face.
 #
 # Designed for safe parallel execution: each auto-push pulls latest from
 # remote first (merge-safe), and failed pushes retry with stash+rebase.
 #
 # Usage:
-#   ./scripts/run_futures_update.sh
+#   ./scripts/run_cryptocoin_update.sh
 #
 # Environment variables honoured:
 #   PUSH_INTERVAL_SEC  – seconds between auto-pushes (default 60)
-#   DATA_DIR           – path to the cloned HF dataset repo   (default data/)
+#   DATA_DIR           – path to the cloned HF dataset repo (default data/)
 #   BATCH_TOTAL        – total parallel batches (default 1)
 #   BATCH_INDEX        – this run's batch number, 0-based (default 0)
 # ---------------------------------------------------------------------------
@@ -20,41 +19,32 @@ set -euo pipefail
 
 PUSH_INTERVAL_SEC="${PUSH_INTERVAL_SEC:-60}"
 DATA_DIR="${DATA_DIR:-data}"
-UPDATER_SCRIPT="USDT-M_Perpetual_Futures_updater.py"
+UPDATER_SCRIPT="updater.py"
 OUTPUT_DIR="${OUTPUT_DIR:-output}"
-LOG_FILE="${LOG_FILE:-${OUTPUT_DIR}/futures_update.log}"
+LOG_FILE="${LOG_FILE:-${OUTPUT_DIR}/cryptocoin_update.log}"
 COINS="${COINS:-}"
 
-# Force UTF-8 everywhere — avoids mojibake in the log file on Windows.
 export PYTHONIOENCODING=utf-8
 export LANG=en_US.UTF-8
 export LC_ALL=en_US.UTF-8
 
 # ---- helpers ---------------------------------------------------------------
 mkdir -p "$OUTPUT_DIR"
-
-# Tee all output (stdout+stderr) to both terminal and the log file.
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"; }
 
 # ---------------------------------------------------------------------------
-# merge_safe_pull — pull latest from remote, handling conflicts gracefully.
-#   On success (no local changes to lose): pulls with rebase.
-#   On rebase conflict: stashes local changes, resets to origin/main,
-#   then pops the stash back — local uncommitted data is never lost.
+# merge_safe_pull
 # ---------------------------------------------------------------------------
 merge_safe_pull() {
     if [ -z "$(git -C "$DATA_DIR" status --porcelain)" ]; then
-        # No local changes — safe to just pull
         log "Pulling latest from origin (clean working tree)…"
         git -C "$DATA_DIR" fetch origin main --quiet
         git -C "$DATA_DIR" reset --hard origin/main
         return 0
     fi
 
-    # Dirty tree (unstaged .gitattributes from LFS, new CSV files, etc.).
-    # pull --rebase would fail — go straight to stash + reset + pop.
     log "Pulling latest from origin (dirty tree — stash + reset + pop)…"
     git -C "$DATA_DIR" stash --include-untracked 2>/dev/null || true
     git -C "$DATA_DIR" fetch origin main --quiet
@@ -69,22 +59,17 @@ merge_safe_pull() {
 }
 
 # ---------------------------------------------------------------------------
-# lfs_ensure — make sure all large CSV files are tracked by git-lfs before
-#   committing, so the HF repo doesn't accumulate giant blobs.
+# lfs_ensure
 # ---------------------------------------------------------------------------
 lfs_ensure() {
     git -C "$DATA_DIR" lfs install >/dev/null 2>&1 || true
-
-    # Preemptively LFS-track patterns that always grow large.
-    git -C "$DATA_DIR" lfs track '*_5m.parquet' '*_15m.parquet' '*_30m.parquet' '*_metrics.parquet' >/dev/null 2>&1 || true
-
-    # Catch any remaining Parquet files ≥ 9 MiB that didn't match the
-    # wildcard patterns above. Exclude files already covered.
+    # Track large parquet files
+    git -C "$DATA_DIR" lfs track '*_5m.parquet' '*_15m.parquet' '*_30m.parquet' >/dev/null 2>&1 || true
+    # Catch remaining ≥9 MiB parquet files not covered above
     large=$(find "$DATA_DIR" -name '*.parquet' -size +9M \
         ! -name '*_5m.parquet' \
         ! -name '*_15m.parquet' \
         ! -name '*_30m.parquet' \
-        ! -name '*_metrics.parquet' \
         -printf '%P\n' 2>/dev/null || true)
     if [ -n "$large" ]; then
         echo "$large" | while IFS= read -r f; do
@@ -95,13 +80,7 @@ lfs_ensure() {
 }
 
 # ---------------------------------------------------------------------------
-# push_progress — the core checkpoint routine.
-#   1. LFS setup
-#   2. Stage everything
-#   3. Pull latest (merge-safe — handles parallel runs)
-#   4. Commit + push
-#   5. On push conflict (another run pushed first):
-#      undo commit → stash → pull → pop → recommit → push (up to 3 retries)
+# push_progress
 # ---------------------------------------------------------------------------
 push_progress() {
     log ">>> Auto-pushing progress to HF …"
@@ -111,10 +90,7 @@ push_progress() {
         return 0
     fi
 
-    # 1. LFS tracking
     lfs_ensure
-
-    # 2. Stage everything
     git -C "$DATA_DIR" add -A
 
     if [ -z "$(git -C "$DATA_DIR" status --porcelain)" ]; then
@@ -122,13 +98,9 @@ push_progress() {
         return 0
     fi
 
-    # 3. Sync with remote (stash → fetch → reset → pop --index)
     merge_safe_pull
-
-    # Re-stage in case stash pop --index failed and files became unstaged
     git -C "$DATA_DIR" add -A 2>/dev/null || true
 
-    # 4. Commit
     local commit_msg="auto-save $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     if ! git -C "$DATA_DIR" commit -m "$commit_msg" 2>&1; then
         log "Nothing to commit."
@@ -136,13 +108,11 @@ push_progress() {
     fi
     log "Commit OK, pushing …"
 
-    # 5. Push with retry on race condition
     push_with_retry
 }
 
 # ---------------------------------------------------------------------------
-# push_with_retry — handles the race where another parallel run pushed after
-#   our pull but before our push.
+# push_with_retry
 # ---------------------------------------------------------------------------
 push_with_retry() {
     local max_attempts=5
@@ -158,19 +128,16 @@ push_with_retry() {
 
         log "Push failed (attempt $attempt/$max_attempts): $(echo "$push_out" | head -1)"
 
-        # Rate limit detection — extract Retry-After seconds from HF's 429
         if echo "$push_out" | grep -q "429\|rate.limit\|Too Many Requests"; then
             retry_sec=$(echo "$push_out" | grep -oP 'Retry after \K\d+' | head -1)
             wait="${retry_sec:-$((attempt * 60))}"
             log "Rate limited — waiting ${wait}s…"
             sleep "$wait"
-            # Don't undo commit for rate limits — just retry the same push
             continue
         fi
 
         if [ "$attempt" -lt "$max_attempts" ]; then
             log "Push conflict — undoing commit, re-syncing, and retrying…"
-
             git -C "$DATA_DIR" reset --soft HEAD~1
             git -C "$DATA_DIR" stash --include-untracked
             git -C "$DATA_DIR" fetch origin main --quiet
@@ -201,7 +168,7 @@ push_with_retry() {
 }
 
 # ---------------------------------------------------------------------------
-# cleanup — signal handler: push final state before exit
+# cleanup
 # ---------------------------------------------------------------------------
 cleanup() {
     log ">>> Caught signal – pushing final state before exit …"
@@ -213,9 +180,9 @@ cleanup() {
 trap cleanup SIGTERM SIGINT SIGHUP
 
 # ---- main ------------------------------------------------------------------
-log "=== Starting futures updater wrapper ==="
+log "=== Starting CryptoCoin updater wrapper ==="
 log "Push interval: ${PUSH_INTERVAL_SEC}s  |  Data dir: $DATA_DIR"
-log "Batch: $((BATCH_INDEX+1))/${BATCH_TOTAL:-1} (index=${BATCH_INDEX:-0})  |  Workers: ${FETCH_WORKERS:-64}"
+log "Batch: $((BATCH_INDEX+1))/${BATCH_TOTAL:-1} (index=${BATCH_INDEX:-0})  |  Workers: ${FETCH_WORKERS:-16}"
 
 # Ensure git user is configured for auto-push commits.
 if ! git -C "$DATA_DIR" config user.email >/dev/null 2>&1; then
@@ -225,15 +192,12 @@ if ! git -C "$DATA_DIR" config user.email >/dev/null 2>&1; then
 fi
 
 # Launch the Python updater in the background.
-# BATCH_TOTAL, BATCH_INDEX, and other env vars are inherited by the Python process.
 poetry run python "$UPDATER_SCRIPT" &
 UPDATER_PID=$!
 log "Python updater started (PID=$UPDATER_PID)"
 
-# Periodic push loop — runs while the updater is alive.
+# Periodic push loop
 while kill -0 "$UPDATER_PID" 2>/dev/null; do
-    # Wait for the push interval, but check the updater is still alive
-    # every few seconds so we don't hang after it exits.
     waited=0
     while [ "$waited" -lt "$PUSH_INTERVAL_SEC" ]; do
         sleep 10
@@ -249,11 +213,9 @@ while kill -0 "$UPDATER_PID" 2>/dev/null; do
     push_progress
 done
 
-# Updater has exited — grab its exit code.
 wait "$UPDATER_PID" || UPDATER_RC=$?
 log "Python updater exited (rc=${UPDATER_RC:-0})"
 
-# Final push.
 push_progress
 log "=== Wrapper finished (updater rc=${UPDATER_RC:-0}) ==="
 exit "${UPDATER_RC:-0}"

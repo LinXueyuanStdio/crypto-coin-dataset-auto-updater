@@ -1,22 +1,40 @@
-name: Update Dataset
+name: Update CryptoCoin Dataset
 
 on:
-  # Run every day at midnight (UTC) — adjust the schedule as needed
   schedule:
     - cron: "0 0 * * *"
-  # Allows manual triggering via the "Actions" tab
   workflow_dispatch:
     inputs:
+      batch_total:
+        description: 'Total number of parallel batches'
+        required: false
+        default: '1'
+        type: string
+      batch_index:
+        description: 'This run''s batch number (0-based)'
+        required: false
+        default: '0'
+        type: string
       fetch_workers:
         description: 'Number of parallel fetch workers'
         required: false
         default: '16'
         type: string
+      push_interval_sec:
+        description: 'Seconds between auto-push checkpoints'
+        required: false
+        default: '60'
+        type: string
+      max_runtime_min:
+        description: 'Soft runtime budget in minutes'
+        required: false
+        default: '100'
+        type: string
 
 jobs:
-  update-dataset:
+  update-cryptocoin-dataset:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 350
 
     steps:
       - name: Check out repository
@@ -37,7 +55,7 @@ jobs:
         run: poetry install
 
       # ------------------------------------------------------------------
-      # Cache-aware HF repo setup
+      # Cache-aware HF repo setup (clone without LFS blobs)
       # ------------------------------------------------------------------
       - name: Setup dataset repository
         id: dataset-repo
@@ -48,50 +66,168 @@ jobs:
           data_dir: data
 
       # ------------------------------------------------------------------
-      # Run the updater
+      # Selectively pull LFS files for this batch's symbols
+      # Spot symbols are resolved from Binance spot API (not futures symbols.json)
+      # ------------------------------------------------------------------
+      - name: Pull LFS for batch symbols
+        working-directory: data
+        env:
+          BATCH_TOTAL: ${{ inputs.batch_total || '1' }}
+          BATCH_INDEX: ${{ inputs.batch_index || '0' }}
+        run: |
+          INCLUDES=$(python3 -c "
+          import os, json, time, sys
+          # Hardcoded fallback — matches updater.py FALLBACK_SYMBOLS
+          FALLBACK = sorted({
+              '1INCHUSDT','AAVEUSDT','ADAUSDT','ALGOUSDT','AVAXUSDT',
+              'BATUSDT','BCHUSDT','BNBUSDT','BTCUSDT','CHZUSDT',
+              'COMPUSDT','CRVUSDT','DOGEUSDT','DOTUSDT','EOSUSDT',
+              'ETCUSDT','ETHUSDT','FILUSDT','FTMUSDT','HBARUSDT',
+              'ICPUSDT','KSMUSDT','LDOUSDT','LINKUSDT','LTCUSDT',
+              'MANAUSDT','MATICUSDT','RUNEUSDT','SANDUSDT','SHIBUSDT',
+              'SNXUSDT','SOLUSDT','SUSHIUSDT','TRXUSDT','UNIUSDT',
+              'WAVESUSDT','XEMUSDT','XLMUSDT','XRPUSDT','YFIUSDT',
+              'ZILUSDT','ZRXUSDT',
+          })
+
+          syms = []
+          # Try Binance spot exchangeInfo API
+          try:
+              import requests
+              for url in [
+                  'https://api.binance.com/api/v3/exchangeInfo',
+                  'https://api-gcp.binance.com/api/v3/exchangeInfo',
+              ]:
+                  resp = requests.get(url, timeout=10)
+                  resp.raise_for_status()
+                  data = resp.json()
+                  syms = sorted(
+                      s['symbol'].encode('utf-8', errors='surrogatepass').decode('utf-8', errors='replace')
+                      for s in data.get('symbols', [])
+                      if s.get('quoteAsset') == 'USDT'
+                      and s.get('status') == 'TRADING'
+                      and 'SPOT' in (s.get('permissions') or [])
+                  )
+                  if syms:
+                      print(f'# spot API ({url}): {len(syms)} symbols', file=sys.stderr)
+                      break
+          except Exception as e:
+              print(f'# spot API failed: {e}', file=sys.stderr)
+
+          if not syms:
+              syms = list(FALLBACK)
+              print(f'# using fallback: {len(syms)} symbols', file=sys.stderr)
+
+          bt = int(os.environ['BATCH_TOTAL'])
+          bi = int(os.environ['BATCH_INDEX'])
+          chunk = (len(syms) + bt - 1) // bt
+          start = bi * chunk
+          end = start + chunk if bi < bt - 1 else len(syms)
+          for s in syms[start:end]:
+              print(f'--include={s}/**')
+          " | tr '\n' ' ')
+          if [ -n "$INCLUDES" ]; then
+            git lfs pull $INCLUDES 2>&1 || true
+          fi
+          echo "LFS pull done"
+
+      # ------------------------------------------------------------------
+      # Run the spot updater with periodic auto-push (checkpoints)
       # ------------------------------------------------------------------
       - name: Run the dataset update script with retries
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
           BINANCE_API_SECRET: ${{ secrets.BINANCE_API_SECRET }}
+          DATASET_SLUG: linxy/CryptoCoin
+          DATA_DIR: data
+          MAX_RUNTIME_MIN: ${{ inputs.max_runtime_min || '100' }}
           FETCH_WORKERS: ${{ inputs.fetch_workers || '16' }}
+          PUSH_INTERVAL_SEC: ${{ inputs.push_interval_sec || '60' }}
+          BATCH_TOTAL: ${{ inputs.batch_total || '1' }}
+          BATCH_INDEX: ${{ inputs.batch_index || '0' }}
           PYTHONUNBUFFERED: "1"
+          PROXY: ""
         run: |
           max_retries=5
           retry=0
-          until poetry run python updater.py; do
+          until bash scripts/run_cryptocoin_update.sh; do
             retry=$((retry + 1))
             if [ "$retry" -ge "$max_retries" ]; then
-              echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] updater.py failed $retry times, giving up."
+              echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] updater failed $retry times, giving up."
               exit 1
             fi
-            echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Dataset update failed (attempt $retry/$max_retries), retrying in 30 seconds..."
+            echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Update failed (attempt $retry/$max_retries), retrying in 30s..."
             sleep 30
           done
 
       # ------------------------------------------------------------------
-      # Squash history to keep the HF repo compact
+      # Generate run summary
+      # ------------------------------------------------------------------
+      - name: Generate run summary
+        if: always()
+        env:
+          PYTHONIOENCODING: utf-8:replace
+        run: |
+          if [ -f output/run_summary_cryptocoin.json ]; then
+            poetry run python -c "
+          import json
+          with open('output/run_summary_cryptocoin.json') as f:
+              s = json.load(f)
+          with open('output/summary.md','w') as out:
+           print(f'# CryptoCoin — Run Summary', file=out)
+           print(f'| Item | Value |', file=out)
+           print(f'|------|-------|', file=out)
+           print(f'| Batch | {s.get(\"batch_index\",0)} / {s.get(\"batch_total\",1)} |', file=out)
+           print(f'| Start | {s.get(\"start_time\",\"?\")} |', file=out)
+           print(f'| End | {s.get(\"end_time\",\"?\")} |', file=out)
+           print(f'| Elapsed | {s.get(\"elapsed_seconds\",\"?\")}s ({s.get(\"budget_limit_min\",\"?\")}min budget) |', file=out)
+           print(f'| Series produced | {s.get(\"produced\",0)} |', file=out)
+           print(f'| Series failed | {s.get(\"failed\",0)} |', file=out)
+           print(f'| Symbols updated | {s.get(\"symbols_updated\",0)} |', file=out)
+           print(f'| Remaining (next run) | {s.get(\"remaining\",0)} |', file=out)
+           print('', file=out)
+           if s.get('per_symbol'):
+               print('### Updated symbols', file=out)
+               print('| Symbol | Updated | Failed |', file=out)
+               print('|--------|---------|--------|', file=out)
+               for sym, info in sorted(s['per_symbol'].items()):
+                   print(f'| {sym} | {info.get(\"updated\",0)} | {info.get(\"failed\",0)} |', file=out)
+          " 2>&1
+            cat output/summary.md >> $GITHUB_STEP_SUMMARY
+          else
+            echo "No run_summary.json found — updater may not have run." >> $GITHUB_STEP_SUMMARY
+          fi
+
+      # ------------------------------------------------------------------
+      # Squash history — only the master batch squashes
       # ------------------------------------------------------------------
       - name: Squash dataset repository history to a single commit
         if: always() && steps.dataset-repo.outcome == 'success'
         working-directory: data
+        env:
+          BATCH_INDEX: ${{ inputs.batch_index || '0' }}
+          BATCH_TOTAL: ${{ inputs.batch_total || '1' }}
         run: |
           set -e
+
+          if [ "${BATCH_INDEX:-0}" != "0" ] && [ "${BATCH_TOTAL:-1}" != "1" ]; then
+            echo "Batch $BATCH_INDEX/$BATCH_TOTAL — skipping squash (master batch only)"
+            exit 0
+          fi
+
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
 
-          # Pull latest in case the updater pushed, then another parallel
-          # run pushed after us (race between updater exit and squash).
           git fetch origin main --quiet
           git reset --hard "origin/main"
 
           BRANCH=$(git rev-parse --abbrev-ref HEAD)
           BEFORE_SHA=$(git rev-parse HEAD)
 
-          # If only one commit in this run, skip squash (nothing to do).
-          ROOT_SHA=$(git rev-list --max-parents=0 HEAD)
-          if [ "$(git rev-list --count "$ROOT_SHA..HEAD")" -le 1 ]; then
+          ROOT_SHA=$(git rev-list --max-parents=0 HEAD 2>/dev/null || echo "")
+          COMMIT_COUNT=$(git rev-list --count "$ROOT_SHA..HEAD" 2>/dev/null || echo "1")
+          if [ "${COMMIT_COUNT:-1}" -le 1 ]; then
             echo "Single commit — squash not needed (HEAD=$BEFORE_SHA)"
             exit 0
           fi
@@ -101,16 +237,14 @@ jobs:
           git commit -m "Squash history — was ${BEFORE_SHA}, $(date -u +%Y-%m-%dT%H:%M:%SZ)"
           git branch -D "$BRANCH"
           git branch -m "$BRANCH"
-
-          # --force-with-lease guards against overwriting commits pushed
-          # by another process after our fetch above.
           git push origin "$BRANCH" --force-with-lease="$BRANCH:$BEFORE_SHA"
 
           git reflog expire --expire=now --all 2>/dev/null || true
           git gc --prune=now --aggressive 2>/dev/null || true
+          echo "Post-squash .git size: $(du -sh .git | cut -f1)"
 
       # ------------------------------------------------------------------
-      # Save caches for the next run (.git + per-symbol data, via action)
+      # Save the cache for the next run
       # ------------------------------------------------------------------
       - name: Save dataset caches
         if: always() && steps.dataset-repo.outcome == 'success'
