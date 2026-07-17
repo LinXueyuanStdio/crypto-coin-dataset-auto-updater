@@ -74,8 +74,17 @@ runs:
         exit 1
 
     # ==================================================================
-    # SAVE — cache entire data/ (no LFS blobs → small)
+    # SAVE — replace LFS blobs with pointers first, then cache
     # ==================================================================
+    - name: Strip LFS blobs before cache
+      if: inputs.mode == 'save'
+      shell: bash
+      run: |
+        cd "${{ inputs.data_dir }}" 2>/dev/null || exit 0
+        GIT_LFS_SKIP_SMUDGE=1 git checkout HEAD -- . 2>/dev/null || true
+        rm -rf .git/lfs 2>/dev/null || true
+        echo "LFS blobs stripped — cache will be metadata-only"
+
     - name: Save data cache
       if: inputs.mode == 'save'
       id: save-cache
