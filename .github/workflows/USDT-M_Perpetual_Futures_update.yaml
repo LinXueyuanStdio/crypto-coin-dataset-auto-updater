@@ -41,6 +41,11 @@ on:
         required: false
         default: true
         type: boolean
+      squash_history:
+        description: 'Squash dataset repo history to a single commit (master batch only)'
+        required: false
+        default: true
+        type: boolean
 
 jobs:
   update-futures-dataset:
@@ -268,7 +273,7 @@ jobs:
       # Squash history — only the master batch squashes to avoid races
       # ------------------------------------------------------------------
       - name: Squash dataset repository history to a single commit
-        if: always() && steps.dataset-repo.outcome == 'success'
+        if: always() && steps.dataset-repo.outcome == 'success' && inputs.squash_history != false
         working-directory: data
         env:
           BATCH_INDEX: ${{ inputs.batch_index || '0' }}
