@@ -46,6 +46,11 @@ on:
         required: false
         default: true
         type: boolean
+      force_full_fetch:
+        description: 'Ignore _index.json, force full-history fetch for this batch/COINS'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   update-futures-dataset:
@@ -220,6 +225,7 @@ jobs:
           BATCH_INDEX: ${{ inputs.batch_index || '0' }}
           PYTHONUNBUFFERED: "1"
           PROXY: ""
+          FORCE_FULL_FETCH: ${{ inputs.force_full_fetch || 'false' }}
         run: |
           max_retries=5
           retry=0

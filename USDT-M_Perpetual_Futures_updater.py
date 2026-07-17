@@ -701,6 +701,10 @@ def run_update(data_folder, end_date=None, budget=None, max_workers=None,
         index = fresh
         logger.info("Index reloaded: %d entries", len(index))
 
+    force_full = os.getenv("FORCE_FULL_FETCH", "").lower() in ("1", "true", "yes")
+    if force_full:
+        logger.info("FORCE_FULL_FETCH enabled — index timestamps ignored, will fetch full history")
+
     pending = []
     for job in all_jobs:
         if my_symbols is not None and job.symbol not in my_symbols:
@@ -708,8 +712,11 @@ def run_update(data_folder, end_date=None, budget=None, max_workers=None,
         filename = output_filename(job.dt, job.symbol, job.interval)
         data_path = os.path.join(data_folder, filename)
         last_dt = index_last_dt(index, filename)
-        if needs_update(last_dt, end_date, data_path, job.dt.time_col):
-            pending.append((job, filename, last_dt))
+        if not needs_update(last_dt, end_date, data_path, job.dt.time_col):
+            continue
+        if force_full:
+            last_dt = None  # ignore index timestamp → full fetch from dt.floor
+        pending.append((job, filename, last_dt))
 
     logger.info("%d/%d series need update (end_date=%s)", len(pending), len(all_jobs), end_date)
 
