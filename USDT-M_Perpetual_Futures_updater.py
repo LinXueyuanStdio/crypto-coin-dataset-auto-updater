@@ -353,7 +353,8 @@ def _parse_binance_symbols(raw_symbols):
         including non-ASCII names like '我踏马来了USDT'.
     """
     return sorted(
-        s["symbol"] for s in raw_symbols
+        s["symbol"].encode("utf-8", errors="surrogatepass").decode("utf-8", errors="replace")
+        for s in raw_symbols
         if (s.get("quoteAsset") == "USDT"
             and s.get("contractType") == "PERPETUAL"
             and s.get("status") == "TRADING")
@@ -413,7 +414,7 @@ def fetch_usdt_perpetual_symbols():
                     with open(SYMBOLS_CACHE, "w", encoding="utf-8") as f:
                         json.dump(
                             {"_fetched_at": time.time(), "symbols": symbols},
-                            f, ensure_ascii=False,
+                            f, ensure_ascii=True,
                         )
                 except OSError:
                     pass
@@ -427,7 +428,6 @@ def fetch_usdt_perpetual_symbols():
             with open(SYMBOLS_FILE, encoding="utf-8") as f:
                 data = json.load(f)
             symbols = sorted(data.get("symbols", []))
-
             if symbols:
                 logger.info(
                     "Using symbols.json fallback (%d symbols, age=%.1fd)",
