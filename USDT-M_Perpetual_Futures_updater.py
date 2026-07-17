@@ -524,16 +524,16 @@ def needs_update(last_dt, end_date, data_path=None, time_col=None):
 
     Uses the in-memory index timestamp first.  When the index suggests the
     series is already current, we perform a secondary check against the
-    actual CSV on disk — the index may be stale if it was written from a
+    actual file on disk — the index may be stale if it was written from a
     parallel run whose ``save_index`` we pulled after the fetch was done.
     """
     if last_dt is not None and last_dt.date() >= end_date:
-        # Secondary check: read the actual CSV timestamp
+        # Secondary check: read the actual file timestamp
         if data_path and time_col:
             actual_last = latest_stored_time(data_path, time_col)
             if actual_last is not None and actual_last.date() >= end_date:
                 return False
-            # Index says current but CSV disagrees — trust the CSV
+            # Index says current but file disagrees — trust the file
             return True
         return False
     return True
@@ -692,6 +692,14 @@ def run_update(data_folder, end_date=None, budget=None, max_workers=None,
         )
     else:
         my_symbols = None
+
+    # Reload index from disk — the wrapper may have pulled other batches'
+    # _index.json since startup, making our in-memory copy stale.
+    fresh = load_index(data_folder)
+    if fresh:
+        fresh.update(index)  # our entries win (newer data from our own fetch)
+        index = fresh
+        logger.info("Index reloaded: %d entries", len(index))
 
     pending = []
     for job in all_jobs:

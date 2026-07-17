@@ -80,25 +80,32 @@ jobs:
         env:
           BATCH_TOTAL: ${{ inputs.batch_total || '1' }}
           BATCH_INDEX: ${{ inputs.batch_index || '0' }}
+          COINS: ${{ inputs.symbols || '' }}
         run: |
           echo "::group::Resolving batch symbols"
           SYMBOLS_JSON="${GITHUB_WORKSPACE}/symbols.json"
-          SYM_COUNT=$(python3 -c "import json; print(len(json.load(open('${SYMBOLS_JSON}')).get('symbols',[])))")
-          echo "Total symbols: ${SYM_COUNT}  |  Batch: ${BATCH_INDEX}/${BATCH_TOTAL}"
 
-          SYMS=$(python3 -c "
-          import json, os
-          with open('${SYMBOLS_JSON}', encoding='utf-8') as f:
-              data = json.load(f)
-          syms = data.get('symbols', [])
-          bt = int(os.environ['BATCH_TOTAL'])
-          bi = int(os.environ['BATCH_INDEX'])
-          chunk = (len(syms) + bt - 1) // bt
-          start = bi * chunk
-          end = start + chunk if bi < bt - 1 else len(syms)
-          for s in syms[start:end]:
-              print(s)
-          " 2>&1)
+          if [ -n "${COINS:-}" ]; then
+            # COINS is set — only pull those specific symbols
+            SYMS=$(echo "$COINS" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$')
+            echo "COINS filter: $(echo "$SYMS" | wc -l) symbol(s)"
+          else
+            SYM_COUNT=$(python3 -c "import json; print(len(json.load(open('${SYMBOLS_JSON}')).get('symbols',[])))")
+            echo "Total symbols: ${SYM_COUNT}  |  Batch: ${BATCH_INDEX}/${BATCH_TOTAL}"
+            SYMS=$(python3 -c "
+            import json, os
+            with open('${SYMBOLS_JSON}', encoding='utf-8') as f:
+                data = json.load(f)
+            syms = data.get('symbols', [])
+            bt = int(os.environ['BATCH_TOTAL'])
+            bi = int(os.environ['BATCH_INDEX'])
+            chunk = (len(syms) + bt - 1) // bt
+            start = bi * chunk
+            end = start + chunk if bi < bt - 1 else len(syms)
+            for s in syms[start:end]:
+                print(s)
+            " 2>&1)
+          fi
           BATCH_COUNT=$(echo "$SYMS" | grep -c . 2>/dev/null || echo 0)
           echo "This batch: ${BATCH_COUNT} symbol(s)"
           echo "::endgroup::"

@@ -370,6 +370,7 @@ def build_index_from_files(data_folder):
 # ============================================================================
 
 def needs_update(last_dt, end_date, data_path=None, time_col=None):
+    """Determine whether a series needs fetching."""
     if last_dt is not None and last_dt.date() >= end_date:
         if data_path and time_col:
             actual_last = latest_stored_time(data_path, time_col)
@@ -469,6 +470,13 @@ def run_update(data_folder, end_date=None, budget=None, max_workers=None,
         )
     else:
         my_symbols = None
+
+    # Reload index from disk — the wrapper may have pulled other batches'
+    # _index.json since startup, making our in-memory copy stale.
+    fresh = load_index(data_folder)
+    if fresh:
+        fresh.update(index)  # our entries win (newer data from our own fetch)
+        index = fresh
 
     pending = []
     for job in all_jobs:

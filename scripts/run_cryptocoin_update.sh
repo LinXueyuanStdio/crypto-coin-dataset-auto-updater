@@ -77,17 +77,19 @@ push_progress() {
 
     lfs_ensure
     git -C "$DATA_DIR" add -A
+    # Exclude _index.json — committing it mid-run would overwrite other batches' entries
+    git -C "$DATA_DIR" reset -- _index.json 2>/dev/null || true
 
     if [ -z "$(git -C "$DATA_DIR" status --porcelain)" ]; then
         log "No changes to push."
         return 0
     fi
 
-    # 3. Rebase on remote (tree is clean after commit)
     merge_safe_pull
 
     # Re-stage (LFS tracking may have changed .gitattributes)
     git -C "$DATA_DIR" add -A 2>/dev/null || true
+    git -C "$DATA_DIR" reset -- _index.json 2>/dev/null || true
 
     local commit_msg="auto-save $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     if ! git -C "$DATA_DIR" commit -m "$commit_msg" 2>&1; then
@@ -196,6 +198,16 @@ done
 wait "$UPDATER_PID" || UPDATER_RC=$?
 log "Python updater exited (rc=${UPDATER_RC:-0})"
 
+# Final push of data files (excludes _index.json)
 push_progress
+
+# Push _index.json separately — save_index is merge-safe
+if [ -f "$DATA_DIR/_index.json" ]; then
+    log "Pushing _index.json …"
+    git -C "$DATA_DIR" add _index.json
+    git -C "$DATA_DIR" commit -m "update _index.json" 2>/dev/null || true
+    push_with_retry || log "WARNING: _index.json push failed (non-fatal)"
+fi
+
 log "=== Wrapper finished (updater rc=${UPDATER_RC:-0}) ==="
 exit "${UPDATER_RC:-0}"

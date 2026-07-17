@@ -79,9 +79,16 @@ jobs:
         env:
           BATCH_TOTAL: ${{ inputs.batch_total || '1' }}
           BATCH_INDEX: ${{ inputs.batch_index || '0' }}
+          COINS: ${{ inputs.symbols || '' }}
         run: |
           echo "::group::Resolving spot symbols"
-          SYMS=$(python3 -c "
+
+          if [ -n "${COINS:-}" ]; then
+            # COINS is set — only pull those specific symbols
+            SYMS=$(echo "$COINS" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$')
+            echo "COINS filter: $(echo "$SYMS" | wc -l) symbol(s)"
+          else
+            SYMS=$(python3 -c "
           import os, json, sys
           FALLBACK = sorted({
               '1INCHUSDT','AAVEUSDT','ADAUSDT','ALGOUSDT','AVAXUSDT',
@@ -129,6 +136,7 @@ jobs:
           for s in batch_syms:
               print(s)
           " 2>&1)
+          fi
           BATCH_COUNT=$(echo "$SYMS" | grep -c . 2>/dev/null || echo 0)
           echo "This batch: ${BATCH_COUNT} symbol(s)"
           echo "::endgroup::"
