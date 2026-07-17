@@ -39,33 +39,12 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"; }
 
 # ---------------------------------------------------------------------------
-# merge_safe_pull — pull latest from remote, handling conflicts gracefully.
-#   On success (no local changes to lose): pulls with rebase.
-#   On rebase conflict: stashes local changes, resets to origin/main,
-#   then pops the stash back — local uncommitted data is never lost.
+# merge_safe_pull — rebase local commits on top of origin/main.
+#   Called after local commit in push_progress, so working tree is clean.
 # ---------------------------------------------------------------------------
 merge_safe_pull() {
-    if [ -z "$(git -C "$DATA_DIR" status --porcelain)" ]; then
-        # No local changes — safe to just pull
-        log "Pulling latest from origin (clean working tree)…"
-        git -C "$DATA_DIR" fetch origin main --quiet
-        git -C "$DATA_DIR" reset --hard origin/main
-        return 0
-    fi
-
-    # Dirty tree (unstaged .gitattributes from LFS, new CSV files, etc.).
-    # pull --rebase would fail — go straight to stash + reset + pop.
-    log "Pulling latest from origin (dirty tree — stash + reset + pop)…"
-    git -C "$DATA_DIR" stash --include-untracked 2>/dev/null || true
-    git -C "$DATA_DIR" fetch origin main --quiet
-    git -C "$DATA_DIR" reset --hard origin/main
-    if git -C "$DATA_DIR" stash pop --index 2>/dev/null; then
-        log "Stash popped cleanly (index restored)"
-    else
-        log "Stash pop had conflicts (files preserved — updater will reconcile)"
-        git -C "$DATA_DIR" checkout --theirs . 2>/dev/null || true
-        git -C "$DATA_DIR" reset HEAD . 2>/dev/null || true
-    fi
+    log "Rebasing on origin/main …"
+    GIT_LFS_SKIP_SMUDGE=1 git -C "$DATA_DIR" pull --rebase origin main
 }
 
 # ---------------------------------------------------------------------------
@@ -111,10 +90,7 @@ push_progress() {
         return 0
     fi
 
-    # 1. LFS tracking
     lfs_ensure
-
-    # 2. Stage everything
     git -C "$DATA_DIR" add -A
 
     if [ -z "$(git -C "$DATA_DIR" status --porcelain)" ]; then
@@ -122,13 +98,12 @@ push_progress() {
         return 0
     fi
 
-    # 3. Sync with remote (stash → fetch → reset → pop --index)
+    # Rebase on remote (tree is clean — nothing to stash)
     merge_safe_pull
 
-    # Re-stage in case stash pop --index failed and files became unstaged
+    # Re-stage (LFS tracking may have changed .gitattributes)
     git -C "$DATA_DIR" add -A 2>/dev/null || true
 
-    # 4. Commit
     local commit_msg="auto-save $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     if ! git -C "$DATA_DIR" commit -m "$commit_msg" 2>&1; then
         log "Nothing to commit."
@@ -136,13 +111,13 @@ push_progress() {
     fi
     log "Commit OK, pushing …"
 
-    # 5. Push with retry on race condition
     push_with_retry
 }
 
 # ---------------------------------------------------------------------------
-# push_with_retry — handles the race where another parallel run pushed after
-#   our pull but before our push.
+# push_with_retry — retries on rate-limit (429) or race condition.
+#   Uses git pull --rebase to recover from races (another parallel run pushed
+#   between our pull and push). No stash — the tree is clean at this point.
 # ---------------------------------------------------------------------------
 push_with_retry() {
     local max_attempts=5
@@ -158,41 +133,31 @@ push_with_retry() {
 
         log "Push failed (attempt $attempt/$max_attempts): $(echo "$push_out" | head -1)"
 
-        # Rate limit detection — extract Retry-After seconds from HF's 429
+        # Rate limit — extract Retry-After from HF's 429 response
         if echo "$push_out" | grep -q "429\|rate.limit\|Too Many Requests"; then
             retry_sec=$(echo "$push_out" | grep -oP 'Retry after \K\d+' | head -1)
             wait="${retry_sec:-$((attempt * 60))}"
             log "Rate limited — waiting ${wait}s…"
             sleep "$wait"
-            # Don't undo commit for rate limits — just retry the same push
             continue
         fi
 
+        # Push conflict — rebase and retry
         if [ "$attempt" -lt "$max_attempts" ]; then
-            log "Push conflict — undoing commit, re-syncing, and retrying…"
-
-            git -C "$DATA_DIR" reset --soft HEAD~1
-            git -C "$DATA_DIR" stash --include-untracked
-            git -C "$DATA_DIR" fetch origin main --quiet
-            git -C "$DATA_DIR" reset --hard origin/main
-            if git -C "$DATA_DIR" stash pop --index 2>/dev/null; then
-                log "Stash popped cleanly (index restored)"
-            elif git -C "$DATA_DIR" stash pop 2>/dev/null; then
-                log "Stash popped (index lost)"
-            else
-                log "Stash pop had conflicts — keeping our version"
-                git -C "$DATA_DIR" checkout --theirs . 2>/dev/null || true
-                git -C "$DATA_DIR" reset HEAD . 2>/dev/null || true
-            fi
-
-            lfs_ensure
-            git -C "$DATA_DIR" add -A
-            if [ -z "$(git -C "$DATA_DIR" status --porcelain)" ]; then
-                log "No changes after re-sync"
-                return 0
-            fi
-            git -C "$DATA_DIR" commit -m "auto-save $(date -u +%Y-%m-%dT%H:%M:%SZ) [retry $attempt]"
-            sleep $((attempt * 10))
+            log "Push conflict — rebasing and retrying…"
+            GIT_LFS_SKIP_SMUDGE=1 git -C "$DATA_DIR" pull --rebase origin main || {
+                log "Rebase failed — aborting and resetting to origin/main"
+                git -C "$DATA_DIR" rebase --abort 2>/dev/null || true
+                git -C "$DATA_DIR" reset --hard origin/main
+                lfs_ensure
+                git -C "$DATA_DIR" add -A
+                if [ -z "$(git -C "$DATA_DIR" status --porcelain)" ]; then
+                    log "No changes after reset"
+                    return 0
+                fi
+                git -C "$DATA_DIR" commit -m "auto-save $(date -u +%Y-%m-%dT%H:%M:%SZ) [retry $attempt]"
+            }
+            sleep $((attempt * 5))
         fi
     done
 

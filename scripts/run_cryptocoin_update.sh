@@ -35,27 +35,12 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"; }
 
 # ---------------------------------------------------------------------------
-# merge_safe_pull
+# merge_safe_pull — rebase local commits on top of origin/main.
+#   Called after local commit in push_progress, so working tree is clean.
 # ---------------------------------------------------------------------------
 merge_safe_pull() {
-    if [ -z "$(git -C "$DATA_DIR" status --porcelain)" ]; then
-        log "Pulling latest from origin (clean working tree)…"
-        git -C "$DATA_DIR" fetch origin main --quiet
-        git -C "$DATA_DIR" reset --hard origin/main
-        return 0
-    fi
-
-    log "Pulling latest from origin (dirty tree — stash + reset + pop)…"
-    git -C "$DATA_DIR" stash --include-untracked 2>/dev/null || true
-    git -C "$DATA_DIR" fetch origin main --quiet
-    git -C "$DATA_DIR" reset --hard origin/main
-    if git -C "$DATA_DIR" stash pop --index 2>/dev/null; then
-        log "Stash popped cleanly (index restored)"
-    else
-        log "Stash pop had conflicts (files preserved — updater will reconcile)"
-        git -C "$DATA_DIR" checkout --theirs . 2>/dev/null || true
-        git -C "$DATA_DIR" reset HEAD . 2>/dev/null || true
-    fi
+    log "Rebasing on origin/main …"
+    GIT_LFS_SKIP_SMUDGE=1 git -C "$DATA_DIR" pull --rebase origin main
 }
 
 # ---------------------------------------------------------------------------
@@ -98,7 +83,10 @@ push_progress() {
         return 0
     fi
 
+    # 3. Rebase on remote (tree is clean after commit)
     merge_safe_pull
+
+    # Re-stage (LFS tracking may have changed .gitattributes)
     git -C "$DATA_DIR" add -A 2>/dev/null || true
 
     local commit_msg="auto-save $(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -112,7 +100,8 @@ push_progress() {
 }
 
 # ---------------------------------------------------------------------------
-# push_with_retry
+# push_with_retry — retries on rate-limit (429) or race condition.
+#   Uses git pull --rebase to recover from races.
 # ---------------------------------------------------------------------------
 push_with_retry() {
     local max_attempts=5
@@ -137,29 +126,20 @@ push_with_retry() {
         fi
 
         if [ "$attempt" -lt "$max_attempts" ]; then
-            log "Push conflict — undoing commit, re-syncing, and retrying…"
-            git -C "$DATA_DIR" reset --soft HEAD~1
-            git -C "$DATA_DIR" stash --include-untracked
-            git -C "$DATA_DIR" fetch origin main --quiet
-            git -C "$DATA_DIR" reset --hard origin/main
-            if git -C "$DATA_DIR" stash pop --index 2>/dev/null; then
-                log "Stash popped cleanly (index restored)"
-            elif git -C "$DATA_DIR" stash pop 2>/dev/null; then
-                log "Stash popped (index lost)"
-            else
-                log "Stash pop had conflicts — keeping our version"
-                git -C "$DATA_DIR" checkout --theirs . 2>/dev/null || true
-                git -C "$DATA_DIR" reset HEAD . 2>/dev/null || true
-            fi
-
-            lfs_ensure
-            git -C "$DATA_DIR" add -A
-            if [ -z "$(git -C "$DATA_DIR" status --porcelain)" ]; then
-                log "No changes after re-sync"
-                return 0
-            fi
-            git -C "$DATA_DIR" commit -m "auto-save $(date -u +%Y-%m-%dT%H:%M:%SZ) [retry $attempt]"
-            sleep $((attempt * 10))
+            log "Push conflict — rebasing and retrying…"
+            GIT_LFS_SKIP_SMUDGE=1 git -C "$DATA_DIR" pull --rebase origin main || {
+                log "Rebase failed — aborting and resetting to origin/main"
+                git -C "$DATA_DIR" rebase --abort 2>/dev/null || true
+                git -C "$DATA_DIR" reset --hard origin/main
+                lfs_ensure
+                git -C "$DATA_DIR" add -A
+                if [ -z "$(git -C "$DATA_DIR" status --porcelain)" ]; then
+                    log "No changes after reset"
+                    return 0
+                fi
+                git -C "$DATA_DIR" commit -m "auto-save $(date -u +%Y-%m-%dT%H:%M:%SZ) [retry $attempt]"
+            }
+            sleep $((attempt * 5))
         fi
     done
 
