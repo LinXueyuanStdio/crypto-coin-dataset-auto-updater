@@ -100,20 +100,27 @@ runs:
         # Remove cached LFS blobs from .git/lfs
         rm -rf .git/lfs
 
-        # Verify: all LFS-tracked files should now be small pointers
+        # Verify: LFS-tracked files should now be small pointers
+        #   LFS pointer file starts with "version https://git-lfs"
         LARGE_COUNT=$(find . -type f -size +1M \
           ! -path './.git/*' \
-          ! -name '*.parquet' 2>/dev/null | wc -l || echo 0)
-        PARQUET_LFS=$(find . -name '*.parquet' -type f -size +200c 2>/dev/null | while read f; do
-          head -c4 "$f" 2>/dev/null | grep -q 'version https://git-lfs' && echo "$f"
-        done | wc -l || echo 0)
+          ! -name '*.parquet' 2>/dev/null | wc -l)
+        PARQUET_LFS=$(find . -name '*.parquet' -type f -size +200c 2>/dev/null | while IFS= read -r f; do
+          read -r first_line < "$f" 2>/dev/null
+          case "$first_line" in
+            "version https://git-lfs"*) echo "$f" ;;
+          esac
+        done | wc -l)
+        # Strip leading spaces from wc -l output
+        LARGE_COUNT="${LARGE_COUNT## }"
+        PARQUET_LFS="${PARQUET_LFS## }"
 
         AFTER=$(du -sh . 2>/dev/null | cut -f1 || echo '?')
         echo "  LFS blobs stripped — ${BEFORE} → ${AFTER}"
-        if [ "${PARQUET_LFS:-0}" -gt 0 ]; then
+        if [ -n "${PARQUET_LFS}" ] && [ "${PARQUET_LFS}" -gt 0 ] 2>/dev/null; then
           echo "  ⚠️  ${PARQUET_LFS} parquet files are still LFS pointers (not blobs) — ✓ ok"
         fi
-        if [ "${LARGE_COUNT:-0}" -gt 0 ]; then
+        if [ -n "${LARGE_COUNT}" ] && [ "${LARGE_COUNT}" -gt 0 ] 2>/dev/null; then
           echo "  ⚠️  ${LARGE_COUNT} non-parquet files >1M remain — may bloat cache"
         fi
 
