@@ -538,7 +538,8 @@ def run_update(data_folder, end_date=None, budget=None, max_workers=None,
                 checkpoint_pending += 1
 
             if checkpoint_pending >= CHECKPOINT_EVERY_N:
-                save_index(data_folder, index)
+                # Reload index from disk (other batches' updates) but do NOT
+                # save — writing _index.json blocks git pull --rebase
                 fresh = load_index(data_folder)
                 fresh.update(index)
                 index = fresh

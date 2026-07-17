@@ -760,12 +760,12 @@ def run_update(data_folder, end_date=None, budget=None, max_workers=None,
 
                 checkpoint_pending += 1
 
-            # ---- periodic checkpoint: save + reload index ----
-            # Saves our progress to disk so the shell wrapper can push it.
-            # Reloads from disk to incorporate other batches' _index.json
-            # entries that were git-pulled by the wrapper since last load.
+            # ---- periodic checkpoint: reload index from disk ----
+            # Incorporates other batches' _index.json entries that were
+            # git-pulled by the wrapper since last load.  We do NOT save
+            # our own entries here (save_index writes to disk, which would
+            # block git pull --rebase in the wrapper).
             if checkpoint_pending >= CHECKPOINT_EVERY_N:
-                save_index(data_folder, index)
                 fresh = load_index(data_folder)
                 fresh.update(index)  # our in-memory entries win over disk
                 index = fresh

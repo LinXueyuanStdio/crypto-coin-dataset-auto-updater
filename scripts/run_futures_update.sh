@@ -44,6 +44,8 @@ log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"; }
 # ---------------------------------------------------------------------------
 merge_safe_pull() {
     log "Rebasing on origin/main …"
+    # _index.json is local-only — discard changes so rebase can proceed
+    git -C "$DATA_DIR" checkout -- _index.json 2>/dev/null || true
     GIT_LFS_SKIP_SMUDGE=1 git -C "$DATA_DIR" pull --rebase origin main
 }
 
@@ -149,12 +151,14 @@ push_with_retry() {
         # Push conflict — rebase and retry
         if [ "$attempt" -lt "$max_attempts" ]; then
             log "Push conflict — rebasing and retrying…"
+            git -C "$DATA_DIR" checkout -- _index.json 2>/dev/null || true
             GIT_LFS_SKIP_SMUDGE=1 git -C "$DATA_DIR" pull --rebase origin main || {
                 log "Rebase failed — aborting and resetting to origin/main"
                 git -C "$DATA_DIR" rebase --abort 2>/dev/null || true
                 git -C "$DATA_DIR" reset --hard origin/main
                 lfs_ensure
                 git -C "$DATA_DIR" add -A
+                git -C "$DATA_DIR" reset -- _index.json 2>/dev/null || true
                 if [ -z "$(git -C "$DATA_DIR" status --porcelain)" ]; then
                     log "No changes after reset"
                     return 0
