@@ -156,6 +156,7 @@ jobs:
           }
 
           suspicious = []
+          corrupted = []
           ok = 0
           skipped = 0
           total = 0
@@ -188,7 +189,7 @@ jobs:
                   try:
                       df = pd.read_parquet(fp, columns=[time_col])
                   except Exception as e:
-                      suspicious.append((fp, dt_key, floor, None, None, 0, f'read error: {e}'))
+                      corrupted.append((fp, dt_key, floor, str(e)))
                       continue
 
                   if df.empty or time_col not in df.columns:
@@ -215,39 +216,43 @@ jobs:
                       ok += 1
 
                   if total % 500 == 0:
-                      print(f'  [{total}] checked … (ok={ok}, suspicious={len(suspicious)}, skipped={skipped})', flush=True)
+                      print(f'  [{total}] checked … (ok={ok}, incomplete={len(suspicious)}, corrupted={len(corrupted)}, skipped={skipped})', flush=True)
 
           # ---- report ----
+          all_bad = suspicious + corrupted
           print(f'Total files checked: {total}')
           print(f'OK (span >= {MIN_SPAN}d or pre-floor): {ok}')
-          print(f'Incomplete: {len(suspicious)}')
+          print(f'Incomplete (span < {MIN_SPAN}d): {len(suspicious)}')
+          print(f'Corrupted (unreadable/empty): {len(corrupted)}')
           if skipped:
-              print(f'Skipped (empty/unparseable): {skipped}')
+              print(f'Skipped (no timestamp data): {skipped}')
           print('')
 
-          if suspicious:
+          if all_bad:
               with open('../output/completeness_report.md', 'w') as out:
                print('# Data Completeness Report', file=out)
                print('', file=out)
                print(f'Min span threshold: **{MIN_SPAN} days**', file=out)
-               print(f'Incomplete files found: **{len(suspicious)}**', file=out)
+               print(f'Incomplete files: **{len(suspicious)}**', file=out)
+               print(f'Corrupted files: **{len(corrupted)}**', file=out)
                print('', file=out)
-               has_note = any(len(e) > 6 and e[6] for e in suspicious)
-               if has_note:
-                   print('| File | Type | Floor | Earliest | Latest | Span | Note |', file=out)
-                   print('|------|------|-------|----------|--------|------|------|', file=out)
-                   for row in sorted(suspicious):
-                       fp, dt_key, floor, earliest, latest, span_days = row[:6]
-                       note = row[6] if len(row) > 6 else ''
-                       e_str = f'{earliest.date()}' if earliest else '?'
-                       l_str = f'{latest.date()}' if latest else '?'
-                       print(f'| {fp} | {dt_key} | {floor} | {e_str} | {l_str} | {span_days}d | {note} |', file=out)
-               else:
+               if suspicious:
+                   print('## Incomplete (span < threshold)', file=out)
+                   print('', file=out)
                    print('| File | Type | Floor | Earliest | Latest | Span |', file=out)
                    print('|------|------|-------|----------|--------|------|', file=out)
                    for row in sorted(suspicious):
                        fp, dt_key, floor, earliest, latest, span_days = row[:6]
                        print(f'| {fp} | {dt_key} | {floor} | {earliest.date()} | {latest.date()} | {span_days}d |', file=out)
+               if corrupted:
+                   print('', file=out)
+                   print('## Corrupted (unreadable / empty)', file=out)
+                   print('', file=out)
+                   print('| File | Type | Floor | Error |', file=out)
+                   print('|------|------|-------|-------|', file=out)
+                   for row in sorted(corrupted):
+                       fp, dt_key, floor, err = row
+                       print(f'| {fp} | {dt_key} | {floor} | {err[:120]} |', file=out)
               print('Completeness report saved to output/completeness_report.md')
           else:
               print('✅ All files pass completeness check')
@@ -255,36 +260,39 @@ jobs:
                   print('# Data Completeness Report', file=out)
                   print(f'✅ All {total} files pass the {MIN_SPAN}-day span check.', file=out)
 
-          # ---- optionally delete incomplete files ----
-          if DELETE and suspicious:
+          # ---- optionally delete bad files ----
+          delete_list = suspicious + corrupted
+          if DELETE and delete_list:
               from huggingface_hub import HfApi, CommitOperationDelete
               api = HfApi(token=os.environ.get('HF_TOKEN'))
               ops = []
               for row in suspicious:
                   fp = row[0]; earliest = row[3]; span_days = row[5]
-                  if earliest is None:
-                      print(f'  SKIP {fp} (read error, cannot delete)')
-                      continue
                   ops.append(CommitOperationDelete(path_in_repo=fp))
                   os.remove(fp) if os.path.exists(fp) else None
                   print(f'  DELETE {fp} (span={span_days}d, earliest={earliest.date()})')
+              for row in corrupted:
+                  fp = row[0]; err = row[3]
+                  ops.append(CommitOperationDelete(path_in_repo=fp))
+                  os.remove(fp) if os.path.exists(fp) else None
+                  print(f'  DELETE {fp} (corrupted: {err[:80]})')
               if ops:
                   api.create_commit(
                       repo_id='${{ inputs.dataset_slug }}',
                       repo_type='dataset',
-                      commit_message=f'fix: delete {len(ops)} incomplete parquet files (span < {MIN_SPAN}d)',
+                      commit_message=f'fix: delete {len(ops)} bad parquet files ({len(suspicious)} incomplete, {len(corrupted)} corrupted)',
                       operations=ops,
                   )
-                  print(f'{len(ops)} incomplete files deleted — next updater run will re-fetch from scratch')
-          elif DELETE and not suspicious:
-              print('No incomplete files to delete')
+                  print(f'{len(ops)} files deleted — next updater run will re-fetch from scratch')
+          elif DELETE and not delete_list:
+              print('No files to delete')
 
           # ---- rebuild _index.json after deletion ----
-          if DELETE and suspicious:
+          if DELETE and delete_list:
               print('Rebuilding _index.json after deletion …')
               with open('_index.json') as f:
                   idx = json.load(f)
-              removed = [fp for fp, *_ in suspicious if fp in idx]
+              removed = [fp for fp, *_ in ([fp for fp, *_ in suspicious] + [fp for fp, *_ in corrupted]) if fp in idx]
               for fp in removed:
                   del idx[fp]
               with open('_index.json', 'w', encoding='utf-8') as f:
@@ -300,8 +308,10 @@ jobs:
           if os.path.exists('../output/completeness_report.md'):
               with open('../output/completeness_report.md') as f:
                   text = f.read()
-              m = re.search(r'Incomplete files found: \*\*(\d+)\*\*', text)
-              print(m.group(1) if m else 0)
+              m1 = re.search(r'Incomplete files: \*\*(\d+)\*\*', text)
+              m2 = re.search(r'Corrupted files: \*\*(\d+)\*\*', text)
+              total = (int(m1.group(1)) if m1 else 0) + (int(m2.group(1)) if m2 else 0)
+              print(total)
           else:
               print(0)
           ")
