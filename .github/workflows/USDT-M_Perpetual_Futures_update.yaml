@@ -36,6 +36,11 @@ on:
         required: false
         default: ''
         type: string
+      rebuild_index:
+        description: 'Rebuild _index.json from existing parquet files before running updater'
+        required: false
+        default: true
+        type: boolean
 
 jobs:
   update-futures-dataset:
@@ -140,6 +145,57 @@ jobs:
           if [ "$FAIL" -gt 0 ]; then
             echo "⚠️  ${FAIL} symbol(s) failed — updater will fetch fresh data for them"
           fi
+
+      # ------------------------------------------------------------------
+      # Rebuild _index.json from existing parquet files (fast — reads only time columns)
+      # ------------------------------------------------------------------
+      - name: Rebuild _index.json
+        if: ${{ inputs.rebuild_index != false }}
+        working-directory: data
+        run: |
+          echo "::group::Rebuilding _index.json from parquet files …"
+          python3 -c "
+          import os, json, time
+          from pathlib import Path
+          import pandas as pd
+
+          TIME_COLS = {
+              'klines': 'open_time', 'markPrice': 'open_time',
+              'indexPrice': 'open_time', 'premiumIndex': 'open_time',
+              'metrics': 'create_time', 'fundingRate': 'calc_time',
+          }
+
+          idx = {}
+          total = errors = 0
+          t0 = time.monotonic()
+          for root, dirs, files in os.walk('.'):
+              if '.git' in root.split(os.sep):
+                  continue
+              for f in files:
+                  if not f.endswith('.parquet'):
+                      continue
+                  fp = os.path.join(root, f).lstrip('./')
+                  total += 1
+                  base = Path(f).stem
+                  time_col = 'open_time'
+                  for key in TIME_COLS:
+                      if key in base:
+                          time_col = TIME_COLS[key]; break
+                  try:
+                      df = pd.read_parquet(fp, columns=[time_col])
+                  except Exception:
+                      errors += 1; continue
+                  if time_col not in df.columns:
+                      continue
+                  ts = pd.to_datetime(df[time_col], errors='coerce').max()
+                  if pd.notna(ts):
+                      idx[fp] = ts.strftime('%Y-%m-%d %H:%M:%S')
+
+          with open('_index.json', 'w', encoding='utf-8') as out:
+              json.dump(idx, out, indent=0, sort_keys=True, ensure_ascii=False)
+          print(f'Index rebuilt: {len(idx)} entries ({total} files, {errors} errors) in {time.monotonic()-t0:.0f}s')
+          " 2>&1
+          echo "::endgroup::"
 
       # ------------------------------------------------------------------
       # Run the futures updater with periodic auto-push (checkpoints)
