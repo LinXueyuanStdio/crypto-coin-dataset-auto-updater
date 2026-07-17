@@ -135,6 +135,7 @@ jobs:
           MIN_SPAN_DAYS="${MIN_SPAN_DAYS:-30}"
           DELETE_INCOMPLETE="${DELETE_INCOMPLETE:-false}"
 
+          mkdir -p ../output
           echo "::group::Completeness check (min_span=${MIN_SPAN_DAYS}d)"
           echo ""
 
