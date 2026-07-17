@@ -573,11 +573,13 @@ def process_job(dt, symbol, interval, data_folder, end_date, last_dt, downloader
     # ---- idempotency check: re-read index from disk ----
     # Another parallel batch may have already processed this job and its
     # _index.json entry was pulled by the shell wrapper since we last loaded.
-    fresh_index = load_index(data_folder)
-    fresh_last = index_last_dt(fresh_index, out_name)
-    if not needs_update(fresh_last, end_date, data_path, dt.time_col):
-        logger.info("[%s] already up-to-date (another batch did it) — skip", label)
-        return None
+    # Skip this check when force_full_fetch is active.
+    if not force_full:
+        fresh_index = load_index(data_folder)
+        fresh_last = index_last_dt(fresh_index, out_name)
+        if not needs_update(fresh_last, end_date, data_path, dt.time_col):
+            logger.info("[%s] already up-to-date (another batch did it) — skip", label)
+            return None
 
     t0 = time.monotonic()
     logger.info("[%s] fetching ...", label)
