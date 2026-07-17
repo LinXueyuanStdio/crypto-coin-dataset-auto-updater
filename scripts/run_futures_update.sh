@@ -117,14 +117,21 @@ final_push() {
         STASHED=false
     fi
 
-    # Pull latest from remote — if this fails, abandon the run
-    if ! git -C "$DATA_DIR" pull --rebase origin main; then
-        log "FATAL: git pull --rebase failed — abandoning this run"
-        if [ "$STASHED" = true ]; then
-            git -C "$DATA_DIR" stash pop 2>/dev/null || true
+    # Pull latest from remote — retry on transient HF errors
+    for attempt in 1 2 3; do
+        if git -C "$DATA_DIR" pull --rebase origin main 2>&1; then
+            break
         fi
-        exit 1
-    fi
+        if [ "$attempt" -ge 3 ]; then
+            log "FATAL: git pull --rebase failed after 3 attempts — abandoning this run"
+            if [ "$STASHED" = true ]; then
+                git -C "$DATA_DIR" stash pop 2>/dev/null || true
+            fi
+            exit 1
+        fi
+        log "Pull attempt $attempt/3 failed, retrying in $((attempt * 10))s…"
+        sleep $((attempt * 10))
+    done
 
     # Pop stash
     if [ "$STASHED" = true ]; then
@@ -134,28 +141,16 @@ final_push() {
         fi
     fi
 
-    stage_batch_parquets
+    # Final push: commit everything — updater has exited, no risk of races
+    git -C "$DATA_DIR" add -A
 
     if [ -z "$(git -C "$DATA_DIR" diff --cached --name-only)" ]; then
-        log "No data changes to push."
+        log "No changes to push."
     else
         local commit_msg="auto-save $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        if git -C "$DATA_DIR" commit -m "$commit_msg" 2>&1; then
-            log "Commit OK, pushing data …"
-            push_with_retry
-        else
-            log "Nothing to commit."
-        fi
-    fi
-
-    # Push _index.json separately — save_index is merge-safe (reads existing,
-    # merges, writes back), so the on-disk file has all batches' entries.
-    # This must be the LAST push to avoid overwriting other batches' entries.
-    if [ -f "$DATA_DIR/_index.json" ]; then
-        log "Pushing _index.json …"
-        git -C "$DATA_DIR" add _index.json
-        git -C "$DATA_DIR" commit -m "update _index.json" 2>/dev/null || true
-        push_with_retry || log "WARNING: _index.json push failed (non-fatal)"
+        git -C "$DATA_DIR" commit -m "$commit_msg" 2>&1 || true
+        log "Commit OK, pushing …"
+        push_with_retry
     fi
 }
 
