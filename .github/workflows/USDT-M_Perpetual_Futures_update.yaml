@@ -176,6 +176,11 @@ jobs:
           git branch -m "$BRANCH"
           git push origin "$BRANCH" --force-with-lease="$BRANCH:$BEFORE_SHA"
 
+          # Clean up unreachable objects so .git stays small for caching
+          git reflog expire --expire=now --all 2>/dev/null || true
+          git gc --prune=now --aggressive 2>/dev/null || true
+          echo "Post-squash .git size: $(du -sh .git | cut -f1)"
+
       # ------------------------------------------------------------------
       # Save the cache for the next run
       # ------------------------------------------------------------------

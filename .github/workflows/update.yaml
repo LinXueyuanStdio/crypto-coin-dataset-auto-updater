@@ -106,6 +106,9 @@ jobs:
           # by another process after our fetch above.
           git push origin "$BRANCH" --force-with-lease="$BRANCH:$BEFORE_SHA"
 
+          git reflog expire --expire=now --all 2>/dev/null || true
+          git gc --prune=now --aggressive 2>/dev/null || true
+
       # ------------------------------------------------------------------
       # Save caches for the next run (.git + per-symbol data, via action)
       # ------------------------------------------------------------------
