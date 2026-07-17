@@ -508,6 +508,33 @@ def test_symbols_is_mutable_copy(fut):
     assert fut.SYMBOLS is not fut.FALLBACK_SYMBOLS  # independent list
 
 
+def test_parse_binance_symbols_filters_usdt_perpetual_trading(fut):
+    raw = [
+        {"symbol": "BTCUSDT", "quoteAsset": "USDT", "contractType": "PERPETUAL", "status": "TRADING"},
+        {"symbol": "ETHUSDT", "quoteAsset": "USDT", "contractType": "PERPETUAL", "status": "TRADING"},
+        {"symbol": "BTCUSDT_251229", "quoteAsset": "USDT", "contractType": "CURRENT_QUARTER", "status": "TRADING"},
+        {"symbol": "BTCUSDC", "quoteAsset": "USDC", "contractType": "PERPETUAL", "status": "TRADING"},
+        {"symbol": "DOTUSDT", "quoteAsset": "USDT", "contractType": "PERPETUAL", "status": "SETTLING"},
+        {"symbol": "DOGEUSDT", "quoteAsset": "USDT", "contractType": "PERPETUAL", "status": "TRADING"},
+    ]
+    result = fut._parse_binance_symbols(raw)
+    assert result == ["BTCUSDT", "DOGEUSDT", "ETHUSDT"]
+
+
+def test_parse_binance_symbols_preserves_non_ascii(fut):
+    raw = [
+        {"symbol": "龙虾USDT", "quoteAsset": "USDT", "contractType": "PERPETUAL", "status": "TRADING"},
+        {"symbol": "BTCUSDT", "quoteAsset": "USDT", "contractType": "PERPETUAL", "status": "TRADING"},
+        {"symbol": "币安人生USDT", "quoteAsset": "USDT", "contractType": "PERPETUAL", "status": "TRADING"},
+    ]
+    result = fut._parse_binance_symbols(raw)
+    assert result == ["BTCUSDT", "币安人生USDT", "龙虾USDT"]
+
+
+def test_parse_binance_symbols_empty(fut):
+    assert fut._parse_binance_symbols([]) == []
+
+
 def test_resolve_symbols_updates_module_list(fut, monkeypatch, tmp_path):
     monkeypatch.setattr(fut, "SYMBOLS_CACHE", str(tmp_path / ".symbols_cache.json"))
     monkeypatch.setattr(fut, "fetch_usdt_perpetual_symbols", lambda: ["BTCUSDT", "ETHUSDT"])

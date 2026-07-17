@@ -342,6 +342,24 @@ class Job:
     interval: object  # str | None
 
 
+def _parse_binance_symbols(raw_symbols):
+    """Extract TRADING USDT-M perpetual symbol names from raw exchange info.
+
+    Args:
+        raw_symbols: list of symbol dicts from Binance exchangeInfo API.
+
+    Returns:
+        Sorted list of symbol strings (e.g. ['BTCUSDT', 'ETHUSDT', ...]),
+        including non-ASCII names like '我踏马来了USDT'.
+    """
+    return sorted(
+        s["symbol"] for s in raw_symbols
+        if (s.get("quoteAsset") == "USDT"
+            and s.get("contractType") == "PERPETUAL"
+            and s.get("status") == "TRADING")
+    )
+
+
 def fetch_usdt_perpetual_symbols():
     """Fetch all TRADING USDT-M perpetual symbols from Binance Futures API.
 
@@ -381,13 +399,9 @@ def fetch_usdt_perpetual_symbols():
             resp = SESSION.get(url, timeout=15)
             resp.raise_for_status()
             data = resp.json()
-            symbols = [
-                s["symbol"] for s in data.get("symbols", [])
-                if (s.get("quoteAsset") == "USDT"
-                    and s.get("contractType") == "PERPETUAL"
-                    and s.get("status") == "TRADING")
-            ]
+            symbols = _parse_binance_symbols(data.get("symbols", []))
             symbols.sort()
+
             logger.info(
                 "Fetched %d USDT-M perpetual symbols from %s",
                 len(symbols), url,
@@ -399,7 +413,7 @@ def fetch_usdt_perpetual_symbols():
                     with open(SYMBOLS_CACHE, "w", encoding="utf-8") as f:
                         json.dump(
                             {"_fetched_at": time.time(), "symbols": symbols},
-                            f,
+                            f, ensure_ascii=False,
                         )
                 except OSError:
                     pass
@@ -413,6 +427,7 @@ def fetch_usdt_perpetual_symbols():
             with open(SYMBOLS_FILE, encoding="utf-8") as f:
                 data = json.load(f)
             symbols = sorted(data.get("symbols", []))
+
             if symbols:
                 logger.info(
                     "Using symbols.json fallback (%d symbols, age=%.1fd)",
@@ -919,7 +934,7 @@ def run_update(data_folder, end_date=None, budget=None, max_workers=None,
                 "updated": len(symbol_updated.get(sym, [])),
                 "failed": len(symbol_failed.get(sym, [])),
                 "series": sorted(symbol_updated.get(sym, [])),
-                "errors": [e for _, e in symbol_failed.get(sym, [])],
+                "errors": [e[:200] for _, e in symbol_failed.get(sym, [])],
             }
             for sym in sorted(set(list(symbol_updated) + list(symbol_failed)))
         },
@@ -928,7 +943,7 @@ def run_update(data_folder, end_date=None, budget=None, max_workers=None,
     os.makedirs(summary_dir, exist_ok=True)
     summary_path = os.path.join(summary_dir, "run_summary.json")
     with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2, ensure_ascii=False)
+        json.dump(summary, f, indent=2, ensure_ascii=True)
     logger.info("Run summary saved to %s", summary_path)
 
     return produced
