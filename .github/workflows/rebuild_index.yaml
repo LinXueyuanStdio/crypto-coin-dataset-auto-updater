@@ -151,11 +151,21 @@ jobs:
               'indexPrice': 'open_time', 'premiumIndex': 'open_time',
               'metrics': 'create_time', 'fundingRate': 'calc_time',
           }
-          FLOORS = {
+          DEFAULT_FLOORS = {
               'klines': '2020-01', 'markPrice': '2020-01',
               'indexPrice': '2020-01', 'premiumIndex': '2020-01',
               'metrics': '2021-01', 'fundingRate': '2020-01',
           }
+
+          # Load per-symbol listing dates from meta.json
+          listing_dates = {}
+          if os.path.exists('meta.json'):
+              with open('meta.json') as f:
+                  meta = json.load(f)
+              for sym, info in meta.items():
+                  ld = info.get('listing_date')
+                  if ld:
+                      listing_dates[sym] = ld
 
           suspicious = []
           corrupted = []
@@ -173,20 +183,25 @@ jobs:
                   total += 1
 
                   base = Path(f).stem
+                  # Extract symbol from path: e.g. "BTCUSDT/BTCUSDT_1d.parquet" -> "BTCUSDT"
+                  symbol = fp.split('/')[0] if '/' in fp else fp.split('_')[0]
+
                   if 'markPrice' in base:
-                      dt_key, floor = 'markPrice', '2020-01'
+                      dt_key = 'markPrice'
                   elif 'indexPrice' in base:
-                      dt_key, floor = 'indexPrice', '2020-01'
+                      dt_key = 'indexPrice'
                   elif 'premiumIndex' in base:
-                      dt_key, floor = 'premiumIndex', '2020-01'
+                      dt_key = 'premiumIndex'
                   elif 'metrics' in base:
-                      dt_key, floor = 'metrics', '2021-01'
+                      dt_key = 'metrics'
                   elif 'fundingRate' in base:
-                      dt_key, floor = 'fundingRate', '2020-01'
+                      dt_key = 'fundingRate'
                   else:
-                      dt_key, floor = 'klines', '2020-01'
+                      dt_key = 'klines'
 
                   time_col = TIME_COLS[dt_key]
+                  # Use per-symbol listing date if available, otherwise generic floor
+                  floor = listing_dates.get(symbol, DEFAULT_FLOORS[dt_key])
 
                   try:
                       df = pd.read_parquet(fp, columns=[time_col])
