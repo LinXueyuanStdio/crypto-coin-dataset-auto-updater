@@ -101,6 +101,10 @@ final_push() {
         return 0
     fi
 
+    # All git ops in this function skip LFS smudge — the blobs may be
+    # missing on remote (e.g. pushed by another batch, not yet on LFS store).
+    export GIT_LFS_SKIP_SMUDGE=1
+
     # Stash any pending changes (safe — updater has exited)
     log "Stashing changes …"
     if git -C "$DATA_DIR" stash 2>&1; then
@@ -111,7 +115,7 @@ final_push() {
     fi
 
     # Pull latest from remote — if this fails, abandon the run
-    if ! GIT_LFS_SKIP_SMUDGE=1 git -C "$DATA_DIR" pull --rebase origin main; then
+    if ! git -C "$DATA_DIR" pull --rebase origin main; then
         log "FATAL: git pull --rebase failed — abandoning this run"
         if [ "$STASHED" = true ]; then
             git -C "$DATA_DIR" stash pop 2>/dev/null || true
