@@ -98,6 +98,8 @@ jobs:
       # ------------------------------------------------------------------
       - name: Generate run summary
         if: always()
+        env:
+          PYTHONIOENCODING: utf-8:replace
         run: |
           if [ -f output/run_summary.json ]; then
             poetry run python -c "

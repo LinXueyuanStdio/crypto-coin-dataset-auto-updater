@@ -944,7 +944,7 @@ def run_update(data_folder, end_date=None, budget=None, max_workers=None,
     os.makedirs(summary_dir, exist_ok=True)
     summary_path = os.path.join(summary_dir, "run_summary.json")
     with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2, ensure_ascii=True)
+        json.dump(summary, f, indent=2, ensure_ascii=False)
     logger.info("Run summary saved to %s", summary_path)
 
     return produced
