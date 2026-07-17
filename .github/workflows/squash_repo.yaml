@@ -1,0 +1,42 @@
+name: Squash Repo to Single Commit
+
+on:
+  workflow_dispatch:
+    inputs:
+      dataset_slug:
+        default: 'linxy/USDT-M_Perpetual_Futures'
+
+jobs:
+  squash:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Clone and squash
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          set -e
+          URL="https://hf_user:${HF_TOKEN}@huggingface.co/datasets/${{ inputs.dataset_slug }}"
+          git clone "$URL" data
+          cd data
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+
+          BRANCH=$(git rev-parse --abbrev-ref HEAD)
+          BEFORE_SHA=$(git rev-parse HEAD)
+          COMMIT_COUNT=$(git rev-list --count --all 2>/dev/null || echo "0")
+          echo "Commits before: $COMMIT_COUNT"
+          echo ".git size before: $(du -sh .git | cut -f1)"
+
+          git checkout --orphan squash-tmp
+          git add -A
+          git commit -m "Squash — $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git branch -D "$BRANCH" 2>/dev/null || true
+          git branch -m "$BRANCH"
+
+          git reflog expire --expire=now --all
+          git gc --prune=now --aggressive
+
+          echo ".git size after: $(du -sh .git | cut -f1)"
+          git push origin "$BRANCH" --force-with-lease="$BRANCH:$BEFORE_SHA"
+          echo "Done"
