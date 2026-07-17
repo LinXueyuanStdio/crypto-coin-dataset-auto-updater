@@ -76,9 +76,14 @@ jobs:
           BATCH_TOTAL: ${{ inputs.batch_total || '1' }}
           BATCH_INDEX: ${{ inputs.batch_index || '0' }}
         run: |
-          INCLUDES=$(python3 -c "
+          echo "::group::Resolving batch symbols"
+          SYMBOLS_JSON="${GITHUB_WORKSPACE}/symbols.json"
+          SYM_COUNT=$(python3 -c "import json; print(len(json.load(open('${SYMBOLS_JSON}')).get('symbols',[])))")
+          echo "Total symbols: ${SYM_COUNT}  |  Batch: ${BATCH_INDEX}/${BATCH_TOTAL}"
+
+          SYMS=$(python3 -c "
           import json, os
-          with open(os.path.join(os.pardir, 'symbols.json'), encoding='utf-8') as f:
+          with open('${SYMBOLS_JSON}', encoding='utf-8') as f:
               data = json.load(f)
           syms = data.get('symbols', [])
           bt = int(os.environ['BATCH_TOTAL'])
@@ -87,12 +92,42 @@ jobs:
           start = bi * chunk
           end = start + chunk if bi < bt - 1 else len(syms)
           for s in syms[start:end]:
-              print(f'--include={s}/**')
-          " | tr '\n' ' ')
-          if [ -n "$INCLUDES" ]; then
-            git lfs pull $INCLUDES 2>&1 || true
+              print(s)
+          " 2>&1)
+          BATCH_COUNT=$(echo "$SYMS" | grep -c . 2>/dev/null || echo 0)
+          echo "This batch: ${BATCH_COUNT} symbol(s)"
+          echo "::endgroup::"
+
+          if [ "$BATCH_COUNT" -eq 0 ]; then
+            echo "No symbols to pull — skipping"
+            exit 0
           fi
-          echo "LFS pull done"
+
+          # Pull symbol-by-symbol with progress
+          CHUNK=15
+          rm -f /tmp/lfs_pull_ok.txt /tmp/lfs_pull_fail.txt
+          touch /tmp/lfs_pull_ok.txt /tmp/lfs_pull_fail.txt
+          i=0
+          echo "::group::LFS pull (${BATCH_COUNT} symbols)"
+          echo "$SYMS" | while IFS= read -r sym; do
+            [ -z "$sym" ] && continue
+            i=$((i + 1))
+            echo -n "  [${i}/${BATCH_COUNT}] ${sym} ... "
+            if git lfs pull --include="${sym}/**" 2>&1 | tail -1; then
+              echo "ok" >> /tmp/lfs_pull_ok.txt
+            else
+              rc=$?
+              echo "  ⚠️  ${sym} (exit ${rc})"
+              echo "fail" >> /tmp/lfs_pull_fail.txt
+            fi
+          done
+          OK=$(wc -l < /tmp/lfs_pull_ok.txt 2>/dev/null || echo 0)
+          FAIL=$(wc -l < /tmp/lfs_pull_fail.txt 2>/dev/null || echo 0)
+          echo "::endgroup::"
+          echo "LFS pull: ${OK}/${BATCH_COUNT} ok, ${FAIL} failed"
+          if [ "$FAIL" -gt 0 ]; then
+            echo "⚠️  ${FAIL} symbol(s) failed — updater will fetch fresh data for them"
+          fi
 
       # ------------------------------------------------------------------
       # Run the futures updater with periodic auto-push (checkpoints)

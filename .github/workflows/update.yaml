@@ -75,9 +75,9 @@ jobs:
           BATCH_TOTAL: ${{ inputs.batch_total || '1' }}
           BATCH_INDEX: ${{ inputs.batch_index || '0' }}
         run: |
-          INCLUDES=$(python3 -c "
-          import os, json, time, sys
-          # Hardcoded fallback — matches updater.py FALLBACK_SYMBOLS
+          echo "::group::Resolving spot symbols"
+          SYMS=$(python3 -c "
+          import os, json, sys
           FALLBACK = sorted({
               '1INCHUSDT','AAVEUSDT','ADAUSDT','ALGOUSDT','AVAXUSDT',
               'BATUSDT','BCHUSDT','BNBUSDT','BTCUSDT','CHZUSDT',
@@ -89,9 +89,7 @@ jobs:
               'WAVESUSDT','XEMUSDT','XLMUSDT','XRPUSDT','YFIUSDT',
               'ZILUSDT','ZRXUSDT',
           })
-
           syms = []
-          # Try Binance spot exchangeInfo API
           try:
               import requests
               for url in [
@@ -109,27 +107,58 @@ jobs:
                       and 'SPOT' in (s.get('permissions') or [])
                   )
                   if syms:
-                      print(f'# spot API ({url}): {len(syms)} symbols', file=sys.stderr)
+                      sys.stderr.write(f'# spot API: {len(syms)} symbols\n')
                       break
           except Exception as e:
-              print(f'# spot API failed: {e}', file=sys.stderr)
-
+              sys.stderr.write(f'# spot API failed: {e}\n')
           if not syms:
               syms = list(FALLBACK)
-              print(f'# using fallback: {len(syms)} symbols', file=sys.stderr)
+              sys.stderr.write(f'# using fallback: {len(syms)} symbols\n')
 
           bt = int(os.environ['BATCH_TOTAL'])
           bi = int(os.environ['BATCH_INDEX'])
           chunk = (len(syms) + bt - 1) // bt
           start = bi * chunk
           end = start + chunk if bi < bt - 1 else len(syms)
-          for s in syms[start:end]:
-              print(f'--include={s}/**')
-          " | tr '\n' ' ')
-          if [ -n "$INCLUDES" ]; then
-            git lfs pull $INCLUDES 2>&1 || true
+          batch_syms = syms[start:end]
+          for s in batch_syms:
+              print(s)
+          " 2>&1)
+          BATCH_COUNT=$(echo "$SYMS" | grep -c . 2>/dev/null || echo 0)
+          echo "This batch: ${BATCH_COUNT} symbol(s)"
+          echo "::endgroup::"
+
+          if [ "$BATCH_COUNT" -eq 0 ]; then
+            echo "No symbols to pull — skipping"
+            exit 0
           fi
-          echo "LFS pull done"
+
+          # Pull in chunks of 15 to avoid slow/noisy failures at scale
+          CHUNK=15
+          TOTAL=$BATCH_COUNT
+          OK=0
+          FAIL=0
+          echo "::group::Pulling LFS (${TOTAL} symbols, ${CHUNK}/chunk)"
+          echo "$SYMS" | while IFS= read -r sym; do
+            [ -z "$sym" ] && continue
+            echo -n "  [${CHUNK_INDEX:-?}/${TOTAL}] $sym ... "
+            if git lfs pull --include="${sym}/**" 2>&1 | tail -1; then
+              echo "  ✅ $sym"
+              # track progress (write to temp file since subshell)
+              echo "ok" >> /tmp/lfs_pull_ok.txt
+            else
+              rc=$?
+              echo "  ⚠️  $sym (exit $rc)"
+              echo "fail" >> /tmp/lfs_pull_fail.txt
+            fi
+          done
+          OK=$(wc -l < /tmp/lfs_pull_ok.txt 2>/dev/null || echo 0)
+          FAIL=$(wc -l < /tmp/lfs_pull_fail.txt 2>/dev/null || echo 0)
+          echo "::endgroup::"
+          echo "LFS pull: ${OK}/${TOTAL} ok, ${FAIL} failed"
+          if [ "$FAIL" -gt 0 ]; then
+            echo "⚠️  ${FAIL} symbol(s) failed — updater will fetch fresh data for them"
+          fi
 
       # ------------------------------------------------------------------
       # Run the spot updater with periodic auto-push (checkpoints)
