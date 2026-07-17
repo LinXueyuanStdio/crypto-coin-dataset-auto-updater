@@ -711,12 +711,14 @@ def run_update(data_folder, end_date=None, budget=None, max_workers=None,
             continue
         filename = output_filename(job.dt, job.symbol, job.interval)
         data_path = os.path.join(data_folder, filename)
-        last_dt = index_last_dt(index, filename)
-        if not needs_update(last_dt, end_date, data_path, job.dt.time_col):
-            continue
         if force_full:
-            last_dt = None  # ignore index timestamp → full fetch from dt.floor
-        pending.append((job, filename, last_dt))
+            # Force full historical fetch — ignore index, file state, everything.
+            pending.append((job, filename, None))
+        else:
+            last_dt = index_last_dt(index, filename)
+            if not needs_update(last_dt, end_date, data_path, job.dt.time_col):
+                continue
+            pending.append((job, filename, last_dt))
 
     logger.info("%d/%d series need update (end_date=%s)", len(pending), len(all_jobs), end_date)
 
