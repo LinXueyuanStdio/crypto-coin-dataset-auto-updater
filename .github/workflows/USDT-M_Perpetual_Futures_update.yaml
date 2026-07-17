@@ -219,6 +219,7 @@ jobs:
           git config user.name "github-actions[bot]"
 
           # Pull latest from remote to include all parallel runs' commits.
+          export GIT_LFS_SKIP_SMUDGE=1
           git fetch origin main --quiet
           git reset --hard "origin/main"
 

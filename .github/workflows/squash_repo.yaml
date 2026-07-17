@@ -17,7 +17,7 @@ jobs:
         run: |
           set -e
           URL="https://hf_user:${HF_TOKEN}@huggingface.co/datasets/${{ inputs.dataset_slug }}"
-          git clone "$URL" data
+          GIT_LFS_SKIP_SMUDGE=1 git clone "$URL" data
           cd data
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"

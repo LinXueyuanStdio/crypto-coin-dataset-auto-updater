@@ -35,7 +35,7 @@ jobs:
 
           for attempt in 1 2 3; do
             echo "Clone attempt $attempt/3 …"
-            if git clone "$URL" data 2>&1; then
+            if GIT_LFS_SKIP_SMUDGE=1 git clone "$URL" data 2>&1; then
               echo "✅ Clone OK"
               break
             fi
