@@ -8,7 +8,7 @@ on:
         required: false
         default: 'linxy/USDT-M_Perpetual_Futures'
       min_span_days:
-        description: 'Flag files spanning fewer than this many days (0 = skip check)'
+        description: 'Flag files spanning fewer than N days. -1 = use exact listing date (flag if starts ≥1yr after listing). 0 = skip check.'
         required: false
         default: '30'
       delete_incomplete:
@@ -142,9 +142,11 @@ jobs:
           MIN_SPAN = int(os.environ.get('MIN_SPAN_DAYS', '30'))
           DELETE = os.environ.get('DELETE_INCOMPLETE', 'false').lower() == 'true'
 
-          if MIN_SPAN <= 0:
+          if MIN_SPAN == 0:
               print('MIN_SPAN_DAYS=0 — skipping completeness check')
               sys.exit(0)
+
+          USE_LISTING_DATE = (MIN_SPAN == -1)
 
           TIME_COLS = {
               'klines': 'open_time', 'markPrice': 'open_time',
@@ -223,7 +225,14 @@ jobs:
 
                   span_days = (latest - earliest).days
 
-                  if span_days < MIN_SPAN:
+                  if USE_LISTING_DATE:
+                      # -1 mode: compare earliest timestamp against exact listing date
+                      floor_dt = pd.Timestamp(floor + '-01')
+                      if earliest >= floor_dt + pd.DateOffset(years=1):
+                          suspicious.append((fp, dt_key, floor, earliest, latest, span_days, 'starts ≥1yr after listing'))
+                      else:
+                          ok += 1
+                  elif span_days < MIN_SPAN:
                       floor_dt = pd.Timestamp(floor + '-01')
                       if earliest >= floor_dt + pd.DateOffset(years=1):
                           suspicious.append((fp, dt_key, floor, earliest, latest, span_days, ''))
@@ -238,8 +247,13 @@ jobs:
           # ---- report ----
           all_bad = suspicious + corrupted
           print(f'Total files checked: {total}')
-          print(f'OK (span >= {MIN_SPAN}d or pre-floor): {ok}')
-          print(f'Incomplete (span < {MIN_SPAN}d): {len(suspicious)}')
+          if USE_LISTING_DATE:
+              print(f'Mode: listing-date (flag if starts ≥1yr after listing)')
+              print(f'OK (starts within 1yr of listing): {ok}')
+              print(f'Incomplete (starts ≥1yr after listing): {len(suspicious)}')
+          else:
+              print(f'OK (span >= {MIN_SPAN}d or pre-floor): {ok}')
+              print(f'Incomplete (span < {MIN_SPAN}d): {len(suspicious)}')
           print(f'Corrupted (unreadable/empty): {len(corrupted)}')
           if skipped:
               print(f'Skipped (no timestamp data): {skipped}')
@@ -250,7 +264,10 @@ jobs:
               with open('../output/completeness_report.md', 'w') as out:
                print('# Data Completeness Report', file=out)
                print('', file=out)
-               print(f'Min span threshold: **{MIN_SPAN} days**', file=out)
+               if USE_LISTING_DATE:
+                   print(f'Mode: **listing-date** (flag if earliest ≥ 1 year after listing)', file=out)
+               else:
+                   print(f'Min span threshold: **{MIN_SPAN} days**', file=out)
                print(f'Incomplete files: **{len(suspicious)}**', file=out)
                print(f'Corrupted files: **{len(corrupted)}**', file=out)
                print('', file=out)
