@@ -120,6 +120,9 @@ jobs:
           echo "This batch: ${BATCH_COUNT} symbol(s)"
           echo "::endgroup::"
 
+          # Export batch symbols for the wrapper
+          echo "COINS=$(echo "$SYMS" | paste -sd ',')" >> "$GITHUB_ENV"
+
           if [ "$BATCH_COUNT" -eq 0 ]; then
             echo "No symbols to pull — skipping"
             exit 0
@@ -217,7 +220,6 @@ jobs:
           BATCH_INDEX: ${{ inputs.batch_index || '0' }}
           PYTHONUNBUFFERED: "1"
           PROXY: ""
-          COINS: ${{ inputs.symbols || '' }}
         run: |
           max_retries=5
           retry=0

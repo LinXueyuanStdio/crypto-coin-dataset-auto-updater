@@ -3,8 +3,10 @@
 # run_cryptocoin_update.sh — wrapper that runs the spot CryptoCoin updater and
 # periodically pushes partial progress to Hugging Face.
 #
-# Designed for safe parallel execution: each auto-push pulls latest from
-# remote first (merge-safe), and failed pushes retry with stash+rebase.
+# Periodic checkpoints: stage only changed *.parquet of this batch, commit
+# locally, then git pull --rebase (fail on conflict).
+# Final push (updater exited): stash, pull --rebase, stash pop, stage + commit
+# + push data, then push _index.json.
 #
 # Usage:
 #   ./scripts/run_cryptocoin_update.sh
@@ -14,6 +16,7 @@
 #   DATA_DIR           – path to the cloned HF dataset repo (default data/)
 #   BATCH_TOTAL        – total parallel batches (default 1)
 #   BATCH_INDEX        – this run's batch number, 0-based (default 0)
+#   COINS              – comma-separated symbols for this batch (default all)
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
@@ -30,44 +33,26 @@ export LC_ALL=en_US.UTF-8
 
 # ---- helpers ---------------------------------------------------------------
 mkdir -p "$OUTPUT_DIR"
+# Tee all output (stdout+stderr) to both terminal and the log file.
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"; }
 
 # ---------------------------------------------------------------------------
-# merge_safe_pull — rebase local commits on top of origin/main.
-#   Called after local commit in push_progress, so working tree is clean.
+# stage_batch_parquets — stage *.parquet for this batch's symbols.
+#   COINS is always set by the workflow (comma-separated batch symbols).
 # ---------------------------------------------------------------------------
-merge_safe_pull() {
-    log "Rebasing on origin/main …"
-    # _index.json is local-only — discard changes so rebase can proceed
-    git -C "$DATA_DIR" checkout -- _index.json 2>/dev/null || true
-    GIT_LFS_SKIP_SMUDGE=1 git -C "$DATA_DIR" pull --rebase origin main
+stage_batch_parquets() {
+    echo "${COINS:-}" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' \
+    | while IFS= read -r sym; do
+        git -C "$DATA_DIR" add "$sym"/*.parquet 2>/dev/null || true
+    done
 }
 
 # ---------------------------------------------------------------------------
-# lfs_ensure
-# ---------------------------------------------------------------------------
-lfs_ensure() {
-    git -C "$DATA_DIR" lfs install >/dev/null 2>&1 || true
-    # Track large parquet files
-    git -C "$DATA_DIR" lfs track '*_5m.parquet' '*_15m.parquet' '*_30m.parquet' >/dev/null 2>&1 || true
-    # Catch remaining ≥9 MiB parquet files not covered above
-    large=$(find "$DATA_DIR" -name '*.parquet' -size +9M \
-        ! -name '*_5m.parquet' \
-        ! -name '*_15m.parquet' \
-        ! -name '*_30m.parquet' \
-        -printf '%P\n' 2>/dev/null || true)
-    if [ -n "$large" ]; then
-        echo "$large" | while IFS= read -r f; do
-            git -C "$DATA_DIR" lfs track "$f" >/dev/null 2>&1 || true
-        done
-        log "LFS-tracked $(echo "$large" | wc -l) extra file(s) ≥9 MiB"
-    fi
-}
-
-# ---------------------------------------------------------------------------
-# push_progress
+# push_progress — periodic checkpoint (updater still running).
+#   Only stages changed *.parquet, nothing else. Commits first so the tree
+#   is clean for git pull --rebase.
 # ---------------------------------------------------------------------------
 push_progress() {
     log ">>> Auto-pushing progress to HF …"
@@ -77,35 +62,98 @@ push_progress() {
         return 0
     fi
 
-    lfs_ensure
-    git -C "$DATA_DIR" add -A
-    # Exclude _index.json — committing it mid-run would overwrite other batches' entries
-    git -C "$DATA_DIR" reset -- _index.json 2>/dev/null || true
+    stage_batch_parquets
 
-    if [ -z "$(git -C "$DATA_DIR" status --porcelain)" ]; then
+    if [ -z "$(git -C "$DATA_DIR" diff --cached --name-only)" ]; then
         log "No changes to push."
         return 0
     fi
 
-    merge_safe_pull
-
-    # Re-stage (LFS tracking may have changed .gitattributes)
-    git -C "$DATA_DIR" add -A 2>/dev/null || true
-    git -C "$DATA_DIR" reset -- _index.json 2>/dev/null || true
-
+    # Commit first so the working tree is clean for rebase.
     local commit_msg="auto-save $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     if ! git -C "$DATA_DIR" commit -m "$commit_msg" 2>&1; then
         log "Nothing to commit."
         return 0
     fi
-    log "Commit OK, pushing …"
+    log "Commit OK, rebasing on origin/main …"
 
+    # Pull --rebase: if conflict, abort and fail. rebase --abort
+    # takes us back to our local commit, so no data is lost.
+    if ! GIT_LFS_SKIP_SMUDGE=1 git -C "$DATA_DIR" pull --rebase origin main; then
+        log "ERROR: rebase conflict — aborting (local data preserved)"
+        git -C "$DATA_DIR" rebase --abort 2>/dev/null || true
+        return 1
+    fi
+
+    log "Pushing …"
     push_with_retry
 }
 
 # ---------------------------------------------------------------------------
-# push_with_retry — retries on rate-limit (429) or race condition.
-#   Uses git pull --rebase to recover from races.
+# final_push — called after the updater has exited.
+#   Uses stash because the updater is dead (safe to move files aside).
+# ---------------------------------------------------------------------------
+final_push() {
+    log ">>> Final push …"
+
+    if [ ! -d "$DATA_DIR/.git" ]; then
+        log "data/ is not a git repo — skipping push (local dev)"
+        return 0
+    fi
+
+    # Stash any pending changes (safe — updater has exited)
+    log "Stashing changes …"
+    if git -C "$DATA_DIR" stash 2>&1; then
+        STASHED=true
+    else
+        log "Nothing to stash"
+        STASHED=false
+    fi
+
+    # Pull latest from remote — if this fails, abandon the run
+    if ! GIT_LFS_SKIP_SMUDGE=1 git -C "$DATA_DIR" pull --rebase origin main; then
+        log "FATAL: git pull --rebase failed — abandoning this run"
+        if [ "$STASHED" = true ]; then
+            git -C "$DATA_DIR" stash pop 2>/dev/null || true
+        fi
+        exit 1
+    fi
+
+    # Pop stash
+    if [ "$STASHED" = true ]; then
+        if ! git -C "$DATA_DIR" stash pop 2>&1; then
+            log "FATAL: stash pop conflict — abandoning this run"
+            exit 1
+        fi
+    fi
+
+    stage_batch_parquets
+
+    if [ -z "$(git -C "$DATA_DIR" diff --cached --name-only)" ]; then
+        log "No data changes to push."
+    else
+        local commit_msg="auto-save $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        if git -C "$DATA_DIR" commit -m "$commit_msg" 2>&1; then
+            log "Commit OK, pushing data …"
+            push_with_retry
+        else
+            log "Nothing to commit."
+        fi
+    fi
+
+    # Push _index.json separately — save_index is merge-safe (reads existing,
+    # merges, writes back), so the on-disk file has all batches' entries.
+    if [ -f "$DATA_DIR/_index.json" ]; then
+        log "Pushing _index.json …"
+        git -C "$DATA_DIR" add _index.json
+        git -C "$DATA_DIR" commit -m "update _index.json" 2>/dev/null || true
+        push_with_retry || log "WARNING: _index.json push failed (non-fatal)"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# push_with_retry — retries on rate-limit (429) or push conflict.
+#   Assumes the working tree is clean (caller has already committed).
 # ---------------------------------------------------------------------------
 push_with_retry() {
     local max_attempts=5
@@ -121,6 +169,7 @@ push_with_retry() {
 
         log "Push failed (attempt $attempt/$max_attempts): $(echo "$push_out" | head -1)"
 
+        # Rate limit — extract Retry-After from HF's 429 response
         if echo "$push_out" | grep -q "429\|rate.limit\|Too Many Requests"; then
             retry_sec=$(echo "$push_out" | grep -oP 'Retry after \K\d+' | head -1)
             wait="${retry_sec:-$((attempt * 60))}"
@@ -129,21 +178,13 @@ push_with_retry() {
             continue
         fi
 
+        # Push conflict — another batch pushed first, rebase and retry
         if [ "$attempt" -lt "$max_attempts" ]; then
             log "Push conflict — rebasing and retrying…"
-            git -C "$DATA_DIR" checkout -- _index.json 2>/dev/null || true
             GIT_LFS_SKIP_SMUDGE=1 git -C "$DATA_DIR" pull --rebase origin main || {
-                log "Rebase failed — aborting and resetting to origin/main"
+                log "Rebase failed — aborting (local data preserved)"
                 git -C "$DATA_DIR" rebase --abort 2>/dev/null || true
-                git -C "$DATA_DIR" reset --hard origin/main
-                lfs_ensure
-                git -C "$DATA_DIR" add -A
-                git -C "$DATA_DIR" reset -- _index.json 2>/dev/null || true
-                if [ -z "$(git -C "$DATA_DIR" status --porcelain)" ]; then
-                    log "No changes after reset"
-                    return 0
-                fi
-                git -C "$DATA_DIR" commit -m "auto-save $(date -u +%Y-%m-%dT%H:%M:%SZ) [retry $attempt]"
+                return 1
             }
             sleep $((attempt * 5))
         fi
@@ -154,11 +195,11 @@ push_with_retry() {
 }
 
 # ---------------------------------------------------------------------------
-# cleanup
+# cleanup — signal handler: push final state before exit
 # ---------------------------------------------------------------------------
 cleanup() {
     log ">>> Caught signal – pushing final state before exit …"
-    push_progress
+    final_push
     log ">>> Cleanup done."
     exit ${UPDATER_RC:-1}
 }
@@ -182,8 +223,10 @@ poetry run python "$UPDATER_SCRIPT" &
 UPDATER_PID=$!
 log "Python updater started (PID=$UPDATER_PID)"
 
-# Periodic push loop
+# Periodic push loop — runs while the updater is alive.
 while kill -0 "$UPDATER_PID" 2>/dev/null; do
+    # Wait for the push interval, but check the updater is still alive
+    # every few seconds so we don't hang after it exits.
     waited=0
     while [ "$waited" -lt "$PUSH_INTERVAL_SEC" ]; do
         sleep 10
@@ -196,22 +239,15 @@ while kill -0 "$UPDATER_PID" 2>/dev/null; do
     if ! kill -0 "$UPDATER_PID" 2>/dev/null; then
         break
     fi
-    push_progress
+    push_progress || log "Checkpoint push failed — will retry next cycle"
 done
 
+# Updater has exited — grab its exit code.
 wait "$UPDATER_PID" || UPDATER_RC=$?
 log "Python updater exited (rc=${UPDATER_RC:-0})"
 
-# Final push of data files (excludes _index.json)
-push_progress
-
-# Push _index.json separately — save_index is merge-safe
-if [ -f "$DATA_DIR/_index.json" ]; then
-    log "Pushing _index.json …"
-    git -C "$DATA_DIR" add _index.json
-    git -C "$DATA_DIR" commit -m "update _index.json" 2>/dev/null || true
-    push_with_retry || log "WARNING: _index.json push failed (non-fatal)"
-fi
+# Final push with stash (safe — updater has exited).
+final_push
 
 log "=== Wrapper finished (updater rc=${UPDATER_RC:-0}) ==="
 exit "${UPDATER_RC:-0}"
