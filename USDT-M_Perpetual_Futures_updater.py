@@ -600,9 +600,10 @@ def process_job(dt, symbol, interval, data_folder, end_date, last_dt, downloader
     new_last = pd.to_datetime(merged[dt.time_col], errors="coerce").max()
     elapsed = time.monotonic() - t0
     ts = new_last.strftime("%Y-%m-%d") if new_last is not pd.NaT else "?"
+    delta = len(merged) - existing_rows
     logger.info(
-        "[%s] done — +%d new rows (was %d, now %d total through %s) (%.1fs)",
-        label, new_rows, existing_rows, len(merged), ts, elapsed,
+        "[%s] done — +%d rows (fetched %d, was %d, now %d through %s) (%.1fs)",
+        label, delta, new_rows, existing_rows, len(merged), ts, elapsed,
     )
     return data_path, (None if pd.isna(new_last) else new_last.to_pydatetime())
 
