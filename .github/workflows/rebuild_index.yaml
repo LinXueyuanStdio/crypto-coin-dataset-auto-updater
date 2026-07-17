@@ -122,8 +122,10 @@ jobs:
       - name: Validate data completeness
         working-directory: data
         env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
           MIN_SPAN_DAYS: ${{ inputs.min_span_days || '30' }}
           DELETE_INCOMPLETE: ${{ inputs.delete_incomplete || 'false' }}
+          PYTHONUNBUFFERED: "1"
         run: |
           MIN_SPAN_DAYS="${MIN_SPAN_DAYS:-30}"
           DELETE_INCOMPLETE="${DELETE_INCOMPLETE:-false}"
@@ -229,6 +231,7 @@ jobs:
           print('')
 
           if all_bad:
+              os.makedirs('../output', exist_ok=True)
               with open('../output/completeness_report.md', 'w') as out:
                print('# Data Completeness Report', file=out)
                print('', file=out)
@@ -253,9 +256,10 @@ jobs:
                    for row in sorted(corrupted):
                        fp, dt_key, floor, err = row
                        print(f'| {fp} | {dt_key} | {floor} | {err[:120]} |', file=out)
-              print('Completeness report saved to output/completeness_report.md')
+              print(f'Completeness report saved (repo root: output/completeness_report.md)')
           else:
               print('✅ All files pass completeness check')
+              os.makedirs('../output', exist_ok=True)
               with open('../output/completeness_report.md', 'w') as out:
                   print('# Data Completeness Report', file=out)
                   print(f'✅ All {total} files pass the {MIN_SPAN}-day span check.', file=out)
@@ -264,18 +268,14 @@ jobs:
           delete_list = suspicious + corrupted
           if DELETE and delete_list:
               from huggingface_hub import HfApi, CommitOperationDelete
-              api = HfApi(token=os.environ.get('HF_TOKEN'))
+              api = HfApi(token=os.environ['HF_TOKEN'])
               ops = []
               for row in suspicious:
-                  fp = row[0]; earliest = row[3]; span_days = row[5]
-                  ops.append(CommitOperationDelete(path_in_repo=fp))
-                  os.remove(fp) if os.path.exists(fp) else None
-                  print(f'  DELETE {fp} (span={span_days}d, earliest={earliest.date()})')
+                  ops.append(CommitOperationDelete(path_in_repo=row[0]))
+                  print(f'  WILL DELETE {row[0]} (span={row[5]}d, earliest={row[3].date()})')
               for row in corrupted:
-                  fp = row[0]; err = row[3]
-                  ops.append(CommitOperationDelete(path_in_repo=fp))
-                  os.remove(fp) if os.path.exists(fp) else None
-                  print(f'  DELETE {fp} (corrupted: {err[:80]})')
+                  ops.append(CommitOperationDelete(path_in_repo=row[0]))
+                  print(f'  WILL DELETE {row[0]} (corrupted: {row[3][:80]})')
               if ops:
                   api.create_commit(
                       repo_id='${{ inputs.dataset_slug }}',
@@ -283,7 +283,12 @@ jobs:
                       commit_message=f'fix: delete {len(ops)} bad parquet files ({len(suspicious)} incomplete, {len(corrupted)} corrupted)',
                       operations=ops,
                   )
-                  print(f'{len(ops)} files deleted — next updater run will re-fetch from scratch')
+                  # Only remove local files after remote commit succeeds
+                  for row in suspicious:
+                      os.remove(row[0]) if os.path.exists(row[0]) else None
+                  for row in corrupted:
+                      os.remove(row[0]) if os.path.exists(row[0]) else None
+                  print(f'{len(ops)} files deleted (remote + local) — next updater run will re-fetch from scratch')
           elif DELETE and not delete_list:
               print('No files to delete')
 
