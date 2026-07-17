@@ -414,7 +414,7 @@ def fetch_usdt_perpetual_symbols():
                     with open(SYMBOLS_CACHE, "w", encoding="utf-8") as f:
                         json.dump(
                             {"_fetched_at": time.time(), "symbols": symbols},
-                            f, ensure_ascii=True,
+                            f, ensure_ascii=False,
                         )
                 except OSError:
                     pass
