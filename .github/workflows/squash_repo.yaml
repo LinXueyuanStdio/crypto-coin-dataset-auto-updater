@@ -28,6 +28,15 @@ jobs:
           echo "Commits before: $COMMIT_COUNT"
           echo ".git size before: $(du -sh .git | cut -f1)"
 
+          # Clean .gitattributes — keep HF defaults (lines 1-60) + Parquet patterns
+          (head -60 .gitattributes
+           echo '*_5m.parquet filter=lfs diff=lfs merge=lfs -text'
+           echo '*_15m.parquet filter=lfs diff=lfs merge=lfs -text'
+           echo '*_30m.parquet filter=lfs diff=lfs merge=lfs -text'
+           echo '*_metrics.parquet filter=lfs diff=lfs merge=lfs -text') > .gitattributes.clean
+          mv .gitattributes.clean .gitattributes
+          echo ".gitattributes: $(wc -l < .gitattributes) lines (was 1352)"
+
           git checkout --orphan squash-tmp
           git add -A
           git commit -m "Squash — $(date -u +%Y-%m-%dT%H:%M:%SZ)"
