@@ -1,0 +1,109 @@
+name: Rebuild _index.json from Parquet files
+
+on: workflow_dispatch
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: pip install pandas pyarrow huggingface_hub
+
+      - name: Clone dataset
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          git clone "https://hf_user:${HF_TOKEN}@huggingface.co/datasets/linxy/USDT-M_Perpetual_Futures" data
+
+      - name: Rebuild _index.json
+        working-directory: data
+        run: |
+          python3 -c "
+          import os, json, time
+          from pathlib import Path
+          import pandas as pd
+
+          DATA_TYPES_KLINE = ['klines', 'markPrice', 'indexPrice', 'premiumIndex']
+          TIME_COLS = {
+              'klines': 'open_time',
+              'markPrice': 'open_time',
+              'indexPrice': 'open_time',
+              'premiumIndex': 'open_time',
+              'metrics': 'create_time',
+              'fundingRate': 'calc_time',
+          }
+
+          idx = {}
+          total = 0
+          t0 = time.monotonic()
+          for root, dirs, files in os.walk('.'):
+              if '.git' in root.split(os.sep):
+                  continue
+              for f in files:
+                  if not f.endswith('.parquet'):
+                      continue
+                  fp = os.path.join(root, f).lstrip('./')
+                  total += 1
+                  try:
+                      df = pd.read_parquet(fp)
+                  except Exception as e:
+                      print(f'  SKIP {fp}: {e}')
+                      continue
+
+                  # Guess time column from filename
+                  base = Path(f).stem
+                  if 'markPrice' in base:
+                      time_col = 'open_time'
+                  elif 'indexPrice' in base:
+                      time_col = 'open_time'
+                  elif 'premiumIndex' in base:
+                      time_col = 'open_time'
+                  elif 'metrics' in base:
+                      time_col = 'create_time'
+                  elif 'fundingRate' in base:
+                      time_col = 'calc_time'
+                  else:
+                      time_col = 'open_time'
+
+                  if time_col not in df.columns:
+                      print(f'  SKIP {fp}: no column {time_col}')
+                      continue
+
+                  ts = pd.to_datetime(df[time_col], errors='coerce').max()
+                  if pd.notna(ts):
+                      idx[fp] = ts.strftime('%Y-%m-%d %H:%M:%S')
+                  if total % 500 == 0:
+                      print(f'  [{total}] scanned …', flush=True)
+
+          with open('_index.json', 'w', encoding='utf-8') as out:
+              json.dump(idx, out, indent=0, sort_keys=True, ensure_ascii=False)
+          print(f'Done: {len(idx)}/{total} files indexed in {time.monotonic()-t0:.0f}s')
+          " 2>&1
+
+      - name: Upload _index.json
+        working-directory: data
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python3 -c "
+          from huggingface_hub import HfApi, CommitOperationAdd
+          import os
+          api = HfApi(token=os.environ['HF_TOKEN'])
+          repo = 'linxy/USDT-M_Perpetual_Futures'
+          api.create_commit(
+              repo_id=repo,
+              repo_type='dataset',
+              commit_message='fix: rebuild _index.json from Parquet files',
+              operations=[CommitOperationAdd(path_in_repo='_index.json', path_or_fileobj='_index.json')],
+          )
+          print('_index.json uploaded')
+          "
