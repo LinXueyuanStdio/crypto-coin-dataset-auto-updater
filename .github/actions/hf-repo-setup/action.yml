@@ -39,15 +39,17 @@ runs:
       shell: bash
       run: |
         echo "::group::Cache hit — syncing (LFS skipped)"
+        export GIT_LFS_SKIP_SMUDGE=1
         cd "${{ inputs.data_dir }}"
         git remote set-url origin \
           "https://hf_user:${{ inputs.hf_token }}@huggingface.co/datasets/${{ inputs.repo_slug }}" \
           2>/dev/null || git remote add origin \
           "https://hf_user:${{ inputs.hf_token }}@huggingface.co/datasets/${{ inputs.repo_slug }}"
 
-        GIT_LFS_SKIP_SMUDGE=1 git fetch origin main --quiet
+        git fetch origin main --quiet
         git reset --hard "origin/main"
         echo "✅ Synced — HEAD=$(git rev-parse --short HEAD)"
+        du -sh . 2>/dev/null || true
         echo "::endgroup::"
 
     # ==================================================================
@@ -81,9 +83,32 @@ runs:
       shell: bash
       run: |
         cd "${{ inputs.data_dir }}" 2>/dev/null || exit 0
-        GIT_LFS_SKIP_SMUDGE=1 git checkout HEAD -- . 2>/dev/null || true
-        rm -rf .git/lfs 2>/dev/null || true
-        echo "LFS blobs stripped — cache will be metadata-only"
+        export GIT_LFS_SKIP_SMUDGE=1
+        BEFORE=$(du -sh . 2>/dev/null | cut -f1 || echo '?')
+
+        # Replace all LFS-tracked files with pointer files
+        git checkout HEAD -- .
+        echo "  checkout done — size before: ${BEFORE}"
+
+        # Remove cached LFS blobs from .git/lfs
+        rm -rf .git/lfs
+
+        # Verify: all LFS-tracked files should now be small pointers
+        LARGE_COUNT=$(find . -type f -size +1M \
+          ! -path './.git/*' \
+          ! -name '*.parquet' 2>/dev/null | wc -l || echo 0)
+        PARQUET_LFS=$(find . -name '*.parquet' -type f -size +200c 2>/dev/null | while read f; do
+          head -c4 "$f" 2>/dev/null | grep -q 'version https://git-lfs' && echo "$f"
+        done | wc -l || echo 0)
+
+        AFTER=$(du -sh . 2>/dev/null | cut -f1 || echo '?')
+        echo "  LFS blobs stripped — ${BEFORE} → ${AFTER}"
+        if [ "${PARQUET_LFS:-0}" -gt 0 ]; then
+          echo "  ⚠️  ${PARQUET_LFS} parquet files are still LFS pointers (not blobs) — ✓ ok"
+        fi
+        if [ "${LARGE_COUNT:-0}" -gt 0 ]; then
+          echo "  ⚠️  ${LARGE_COUNT} non-parquet files >1M remain — may bloat cache"
+        fi
 
     - name: Save data cache
       if: inputs.mode == 'save'
