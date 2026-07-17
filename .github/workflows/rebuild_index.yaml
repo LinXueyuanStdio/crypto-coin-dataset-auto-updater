@@ -164,6 +164,7 @@ jobs:
 
           suspicious = []
           ok = 0
+          skipped = 0
           total = 0
 
           for root, dirs, files in os.walk('.'):
@@ -195,10 +196,11 @@ jobs:
                   try:
                       df = pd.read_parquet(fp, columns=[time_col])
                   except Exception as e:
-                      suspicious.append((fp, dt_key, f'(read error: {e})'))
+                      suspicious.append((fp, dt_key, floor, None, None, 0, f'(read error: {e})'))
                       continue
 
                   if df.empty or time_col not in df.columns:
+                      skipped += 1
                       continue
 
                   ts = pd.to_datetime(df[time_col], errors='coerce')
@@ -206,30 +208,29 @@ jobs:
                   latest = ts.max()
 
                   if pd.isna(earliest) or pd.isna(latest):
+                      skipped += 1
                       continue
 
                   span_days = (latest - earliest).days
-                  flag = ''
 
                   if span_days < MIN_SPAN:
-                      # Only flag if the earliest data is suspiciously recent
-                      # (more than 1 year after the DataType floor)
                       floor_dt = pd.Timestamp(floor + '-01')
                       if earliest >= floor_dt + pd.DateOffset(years=1):
-                          flag = f'INCOMPLETE'
-                          suspicious.append((fp, dt_key, floor, earliest, latest, span_days))
+                          suspicious.append((fp, dt_key, floor, earliest, latest, span_days, ''))
                       else:
-                          flag = f'short_span_but_old_enough'
+                          ok += 1  # old file, legitimately short span
                   else:
                       ok += 1
 
                   if total % 500 == 0:
-                      print(f'  [{total}] checked … (ok={ok}, suspicious={len(suspicious)})', flush=True)
+                      print(f'  [{total}] checked … (ok={ok}, suspicious={len(suspicious)}, skipped={skipped})', flush=True)
 
           # ---- report ----
           print(f'Total files checked: {total}')
           print(f'OK (span >= {MIN_SPAN}d or pre-floor): {ok}')
-          print(f'Incomplete (span < {MIN_SPAN}d, earliest suspiciously recent): {len(suspicious)}')
+          print(f'Incomplete: {len(suspicious)}')
+          if skipped:
+              print(f'Skipped (empty/unparseable): {skipped}')
           print('')
 
           if suspicious:
@@ -239,10 +240,22 @@ jobs:
                print(f'Min span threshold: **{MIN_SPAN} days**', file=out)
                print(f'Incomplete files found: **{len(suspicious)}**', file=out)
                print('', file=out)
-               print('| File | Type | Floor | Earliest | Latest | Span |', file=out)
-               print('|------|------|-------|----------|--------|------|', file=out)
-               for fp, dt_key, floor, earliest, latest, span_days in sorted(suspicious):
-                   print(f'| {fp} | {dt_key} | {floor} | {earliest.date()} | {latest.date()} | {span_days}d |', file=out)
+               has_note = any(len(e) > 6 and e[6] for e in suspicious)
+               if has_note:
+                   print('| File | Type | Floor | Earliest | Latest | Span | Note |', file=out)
+                   print('|------|------|-------|----------|--------|------|------|', file=out)
+                   for row in sorted(suspicious):
+                       fp, dt_key, floor, earliest, latest, span_days = row[:6]
+                       note = row[6] if len(row) > 6 else ''
+                       e_str = f'{earliest.date()}' if earliest else '?'
+                       l_str = f'{latest.date()}' if latest else '?'
+                       print(f'| {fp} | {dt_key} | {floor} | {e_str} | {l_str} | {span_days}d | {note} |', file=out)
+               else:
+                   print('| File | Type | Floor | Earliest | Latest | Span |', file=out)
+                   print('|------|------|-------|----------|--------|------|', file=out)
+                   for row in sorted(suspicious):
+                       fp, dt_key, floor, earliest, latest, span_days = row[:6]
+                       print(f'| {fp} | {dt_key} | {floor} | {earliest.date()} | {latest.date()} | {span_days}d |', file=out)
               print('Completeness report saved to output/completeness_report.md')
           else:
               print('✅ All files pass completeness check')
@@ -255,7 +268,11 @@ jobs:
               from huggingface_hub import HfApi, CommitOperationDelete
               api = HfApi(token=os.environ.get('HF_TOKEN'))
               ops = []
-              for fp, dt_key, floor, earliest, latest, span_days in suspicious:
+              for row in suspicious:
+                  fp = row[0]; dt_key = row[1]; earliest = row[3]; span_days = row[5]
+                  if earliest is None:
+                      print(f'  SKIP {fp} (read error, cannot delete)')
+                      continue
                   ops.append(CommitOperationDelete(path_in_repo=fp))
                   os.remove(fp) if os.path.exists(fp) else None
                   print(f'  DELETE {fp} (span={span_days}d, earliest={earliest.date()})')
