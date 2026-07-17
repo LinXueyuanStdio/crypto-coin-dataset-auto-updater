@@ -590,116 +590,27 @@ def run_update(data_folder, end_date=None, budget=None, max_workers=None,
     return produced
 
 
-README_TEMPLATE = """---
-license: mit
-task_categories:
-- time-series-forecasting
-language:
-- en
-- zh
-tags:
-- finance
-- cryptocurrency
-- spot
-- binance
-pretty_name: CryptoCoin
-size_categories:
-- 1M<n<10M
----
-
-# CryptoCoin (Binance Spot)
-
-Binance **spot** OHLCV klines for USDT trading pairs.
-
-Auto-updated daily from Binance official data.
-
-币安 **现货** K 线数据集，每日自动更新。
-
-Last updated on `pending`
-
-## Usage
-
-Data is stored as Parquet in per-symbol subdirectories.
-
-```python
-import pandas as pd
-from datasets import load_dataset
-
-klines = load_dataset("linxy/CryptoCoin", data_files=["BTCUSDT/BTCUSDT_1d.parquet"], split="train")
-# Or read directly
-df = pd.read_parquet("hf://datasets/linxy/CryptoCoin/BTCUSDT/BTCUSDT_1d.parquet")
-```
-
-## Quick start
-
-```bash
-GIT_LFS_SKIP_SMUDGE=1 git clone https://huggingface.co/datasets/linxy/CryptoCoin
-cd CryptoCoin
-git lfs pull --include="BTCUSDT/**"
-```
-
-## Intervals
-
-`1d` `12h` `8h` `6h` `4h` `2h` `1h` `30m` `15m` `5m`
-
-## Kline Fields
-
-| Field | Description |
-|---|---|
-| `open_time` | Interval start (ms) |
-| `open` | Opening price |
-| `high` | Highest price |
-| `low` | Lowest price |
-| `close` | Closing price |
-| `volume` | Base asset volume |
-| `close_time` | Interval end (ms) |
-| `quote_volume` | Quote (USDT) volume |
-| `count` | Number of trades |
-| `taker_buy_volume` | Taker buy base volume |
-| `taker_buy_quote_volume` | Taker buy quote volume |
-| `ignore` | Placeholder |
-
-## Available Symbols
-
-See `_index.json` for the full list. Covers TRADING spot USDT pairs on Binance.
-
-## Sources
-
-- **Data:** Binance spot API via [data-api.binance.vision](https://data-api.binance.vision)
-- **Updater:** [GitHub](https://github.com/LinXueyuanStdio/crypto-coin-dataset-auto-updater)
-
-## Bias, Risks, and Limitations
-
-1. **Exchange-specific bias:** Data reflects Binance's order book only.
-2. **Temporal gaps:** Missing data during Binance outages.
-3. **Market volatility:** Cryptocurrency markets are highly volatile.
-4. **Latency:** Data is updated with ~15 min delay after interval close.
-
-## Citation
-
-```bibtex
-@misc{LinXueyuanStdio2025,
-  title = {CryptoCoin (Binance Spot)},
-  author = {Xueyuan Lin},
-  year = {2025},
-  publisher = {Hugging Face},
-  howpublished = {\\url{https://huggingface.co/datasets/linxy/CryptoCoin}},
-}
-```
-
-## Author
-
-- LinXueyuanStdio (GitHub: [@LinXueyuanStdio](https://github.com/LinXueyuanStdio))
-
-Last updated on `pending`
-"""
-
-
 def ensure_readme(path):
+    """Create README.md from .github/README_TEMPLATE_spot.md if it does not exist."""
     if os.path.exists(path):
         return
+    template_path = os.path.join(BASE_DIR, ".github", "README_TEMPLATE_spot.md")
+    if not os.path.exists(template_path):
+        logger.warning("README_TEMPLATE_spot.md not found — skipping README creation")
+        return
+    with open(template_path, encoding="utf-8") as f:
+        body = f.read()
+    # Replace placeholders
+    n = len(SYMBOLS)
+    if os.path.exists(SYMBOLS_FILE):
+        try:
+            with open(SYMBOLS_FILE, encoding="utf-8") as f:
+                n = len(json.load(f).get("symbols", []))
+        except (ValueError, OSError, KeyError):
+            pass
+    body = body.replace("{n_symbols}", str(n))
     with open(path, "w", encoding="utf-8") as f:
-        f.write(README_TEMPLATE)
+        f.write(body)
 
 
 def stamp_readme(path):
