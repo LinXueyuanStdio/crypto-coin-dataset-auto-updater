@@ -1,23 +1,9 @@
 name: 'HF Dataset Repo Setup'
 description: >
-  Cache-aware setup of a HuggingFace dataset repository clone.
-
-  Two-layer cache:
-    1. .git directory (compressed objects, critical path).
-       Hit  → git fetch + reset --hard rebuilds working tree from local objects.
-       Miss → full clone.
-
-    2. Per-symbol data folders (bonus acceleration).
-       Restored AFTER git operations so they survive git clean -fd.
-       Hit  → data already on disk (skip checkout overhead).
-       Miss → data was already checked out by git reset --hard above.
-
-  Key rotation via cache_suffix (e.g. -0, -1, -2) prevents stale cache.
-
-  Usage:
-    - uses: ./.github/actions/hf-repo-setup           # restore
-    - uses: ./.github/actions/hf-repo-setup           # save
-      with: { mode: save, ... }
+  Cache-aware setup using GIT_LFS_SKIP_SMUDGE=1 so the clone is tiny
+  (metadata only, no large LFS blobs).  The entire data/ dir fits in
+  GitHub Actions cache.  After restore, the caller must selectively
+  `git lfs pull --include="SYM/**"` the symbols it needs.
 inputs:
   hf_token:        { required: true }
   repo_slug:       { required: true }
@@ -26,169 +12,74 @@ inputs:
   cache_prefix:    { required: false, default: '' }
   cache_suffix:    { required: false, default: '' }
 outputs:
-  git_cache_hit:
-    value: ${{ steps.restore-git.outputs.cache-hit }}
+  cache_hit:
+    value: ${{ steps.restore-cache.outputs.cache-hit }}
 
 runs:
   using: 'composite'
   steps:
     # ==================================================================
-    # RESTORE — Step 1: .git cache
+    # RESTORE — cache entire data/ (small because LFS blobs are skipped)
     # ==================================================================
-    - name: Restore .git cache
+    - name: Restore data cache
       if: inputs.mode == 'restore'
-      id: restore-git
+      id: restore-cache
       uses: actions/cache/restore@v4
       with:
-        path: ${{ inputs.data_dir }}/.git
-        key: ${{ inputs.cache_prefix || inputs.repo_slug }}-git${{ inputs.cache_suffix }}
-        restore-keys: |
-          ${{ inputs.cache_prefix || inputs.repo_slug }}-git
-
-    # ==================================================================
-    # RESTORE — Step 2a: .git HIT → rebuild working tree
-    # ==================================================================
-    - name: Sync from .git cache
-      if: inputs.mode == 'restore' && steps.restore-git.outputs.cache-hit == 'true'
-      shell: bash
-      run: |
-        echo "::group::.git cache hit — syncing"
-        cd "${{ inputs.data_dir }}"
-
-        git remote set-url origin \
-          "https://hf_user:${{ inputs.hf_token }}@huggingface.co/datasets/${{ inputs.repo_slug }}" \
-          2>/dev/null || git remote add origin \
-          "https://hf_user:${{ inputs.hf_token }}@huggingface.co/datasets/${{ inputs.repo_slug }}"
-
-        # Rescue uncommitted data from a killed previous run.
-        if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
-          echo "⚠ Rescuing uncommitted data"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git config user.name "github-actions[bot]"
-          git add -A && git commit -m "rescue $(date -u +%Y-%m-%dT%H:%M:%SZ)" || true
-          git push origin "$(git rev-parse --abbrev-ref HEAD)" 2>/dev/null || true
-        fi
-
-        # Merge remote into local — preserves existing files.
-        # reset --hard would wipe the working tree, destroying the
-        # symbol cache data restored in step 4.
-        git fetch origin main --quiet
-        git merge "origin/main" --ff-only 2>/dev/null || {
-          echo "Fast-forward not possible (squash detected) — resetting"
-          git reset --hard "origin/main"
-        }
-        git lfs pull 2>/dev/null || true
-
-        echo "✅ Synced — HEAD=$(git rev-parse --short HEAD)"
-        echo "::endgroup::"
-
-    # ==================================================================
-    # RESTORE — Step 2b: .git MISS → full clone
-    # ==================================================================
-    - name: Clone dataset
-      if: inputs.mode == 'restore' && steps.restore-git.outputs.cache-hit != 'true'
-      shell: bash
-      run: |
-        echo "::group::.git cache miss — cloning"
-        ok=0
-        for strategy in "full" "shallow"; do
-          for attempt in 1 2 3; do
-            echo "Clone $strategy/$attempt …"
-            [ "$strategy" = "shallow" ] && depth="--depth 1" || depth=""
-            URL="https://hf_user:${{ inputs.hf_token }}@huggingface.co/datasets/${{ inputs.repo_slug }}"
-            if git clone $depth "$URL" "${{ inputs.data_dir }}" 2>&1; then
-              (cd "${{ inputs.data_dir }}" && git lfs pull 2>/dev/null) || true
-              echo "✅ Clone OK ($strategy) — $(git -C "${{ inputs.data_dir }}" rev-parse --short HEAD)"
-              echo "::endgroup::"
-              exit 0
-            fi
-            echo "Failed ($strategy/$attempt), waiting $((attempt * 30))s…"
-            rm -rf "${{ inputs.data_dir }}"
-            sleep $((attempt * 30))
-          done
-        done
-        echo "❌ Clone failed"
-        exit 1
-
-    # ==================================================================
-    # RESTORE — Step 3: symbol data caches (AFTER git ops, purely additive)
-    # ==================================================================
-    - name: Restore symbol caches
-      if: inputs.mode == 'restore'
-      id: restore-symbols
-      uses: actions/cache/restore@v4
-      with:
-        path: |
-          ${{ inputs.data_dir }}/*/
+        path: ${{ inputs.data_dir }}
         key: ${{ inputs.cache_prefix || inputs.repo_slug }}-data${{ inputs.cache_suffix }}
         restore-keys: |
           ${{ inputs.cache_prefix || inputs.repo_slug }}-data
 
     # ==================================================================
-    # SAVE — .git
+    # RESTORE — cache HIT: fast-forward sync (no LFS download)
     # ==================================================================
-    - name: Save .git cache
-      if: inputs.mode == 'save'
-      id: save-git
-      uses: actions/cache/save@v4
-      with:
-        path: ${{ inputs.data_dir }}/.git
-        key: ${{ inputs.cache_prefix || inputs.repo_slug }}-git${{ inputs.cache_suffix }}
-
-    # ==================================================================
-    # SAVE — per-symbol data folders, budget-aware
-    #
-    #   Budget: 9 GB total (1 GB buffer under the 10 GB limit).
-    #   Symbols sorted alphabetically → greedy inclusion until the
-    #   next symbol would exceed budget.  Deterministic & idempotent.
-    # ==================================================================
-    - name: Compute data cache budget
-      if: inputs.mode == 'save'
-      id: compute-data-paths
+    - name: Sync from cache
+      if: inputs.mode == 'restore' && steps.restore-cache.outputs.cache-hit == 'true'
       shell: bash
       run: |
-        DATA_DIR="${{ inputs.data_dir }}"
-        BUDGET_MB=9000   # 9 GB
+        echo "::group::Cache hit — syncing (LFS skipped)"
+        cd "${{ inputs.data_dir }}"
+        git remote set-url origin \
+          "https://hf_user:${{ inputs.hf_token }}@huggingface.co/datasets/${{ inputs.repo_slug }}" \
+          2>/dev/null || git remote add origin \
+          "https://hf_user:${{ inputs.hf_token }}@huggingface.co/datasets/${{ inputs.repo_slug }}"
 
-        # Reserve space for .git (may already be cached separately)
-        if [ -d "$DATA_DIR/.git" ]; then
-          GIT_SIZE_MB=$(du -sm "$DATA_DIR/.git" 2>/dev/null | cut -f1)
-          AVAIL_MB=$((BUDGET_MB - GIT_SIZE_MB))
-        else
-          AVAIL_MB=$BUDGET_MB
-        fi
-        echo "Git size: ${GIT_SIZE_MB:-0} MB  |  Available for data: $AVAIL_MB MB"
+        GIT_LFS_SKIP_SMUDGE=1 git fetch origin main --quiet
+        git reset --hard "origin/main"
+        echo "✅ Synced — HEAD=$(git rev-parse --short HEAD)"
+        echo "::endgroup::"
 
-        cumul=0
-        included=""
-        for dir in $(ls -1d "$DATA_DIR"/*/ 2>/dev/null | sort); do
-          sz=$(du -sm "$dir" 2>/dev/null | cut -f1)
-          next=$((cumul + sz))
-          if [ "$next" -le "$AVAIL_MB" ]; then
-            cumul=$next
-            included="$included"$'\n'"$dir"
-            echo "  + $(basename "$dir")  ${sz}MB  (total ${cumul}MB)"
-          else
-            echo "  SKIP $(basename "$dir")  ${sz}MB  (would be ${next}MB > ${AVAIL_MB}MB)"
+    # ==================================================================
+    # RESTORE — cache MISS: clone without LFS blobs
+    # ==================================================================
+    - name: Clone dataset
+      if: inputs.mode == 'restore' && steps.restore-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        echo "::group::Cache miss — cloning (LFS skipped)"
+        URL="https://hf_user:${{ inputs.hf_token }}@huggingface.co/datasets/${{ inputs.repo_slug }}"
+        for attempt in 1 2 3; do
+          echo "Clone attempt $attempt/3 …"
+          if GIT_LFS_SKIP_SMUDGE=1 git clone "$URL" "${{ inputs.data_dir }}" 2>&1; then
+            echo "✅ Clone OK — $(cd "${{ inputs.data_dir }}" && git rev-parse --short HEAD)"
+            echo "::endgroup::"
+            exit 0
           fi
+          echo "Failed, waiting $((attempt * 30))s…"
+          rm -rf "${{ inputs.data_dir }}"
+          sleep $((attempt * 30))
         done
+        echo "❌ Clone failed"
+        exit 1
 
-        if [ -z "$included" ]; then
-          echo "⚠ No symbol folders fit in budget — skipping data cache"
-          echo "paths=" >> "$GITHUB_OUTPUT"
-          echo "empty=true" >> "$GITHUB_OUTPUT"
-        else
-          echo "paths<<PATHS" >> "$GITHUB_OUTPUT"
-          echo "$included" >> "$GITHUB_OUTPUT"
-          echo "PATHS" >> "$GITHUB_OUTPUT"
-          echo "empty=false" >> "$GITHUB_OUTPUT"
-          echo "Cached $(echo "$included" | wc -l) symbol(s), ${cumul}MB total"
-        fi
-
-    - name: Save symbol caches
-      if: inputs.mode == 'save' && steps.compute-data-paths.outputs.empty != 'true'
-      id: save-symbols
+    # ==================================================================
+    # SAVE — cache entire data/ (no LFS blobs → small)
+    # ==================================================================
+    - name: Save data cache
+      if: inputs.mode == 'save'
+      id: save-cache
       uses: actions/cache/save@v4
       with:
-        path: ${{ steps.compute-data-paths.outputs.paths }}
+        path: ${{ inputs.data_dir }}
         key: ${{ inputs.cache_prefix || inputs.repo_slug }}-data${{ inputs.cache_suffix }}

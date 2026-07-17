@@ -57,7 +57,7 @@ jobs:
         run: poetry install
 
       # ------------------------------------------------------------------
-      # Cache-aware HF repo setup
+      # Cache-aware HF repo setup (clone without LFS blobs)
       # ------------------------------------------------------------------
       - name: Setup dataset repository
         id: dataset-repo
@@ -66,6 +66,33 @@ jobs:
           hf_token: ${{ secrets.HF_TOKEN }}
           repo_slug: linxy/USDT-M_Perpetual_Futures
           data_dir: data
+
+      # ------------------------------------------------------------------
+      # Selectively pull LFS files for this batch's symbols
+      # ------------------------------------------------------------------
+      - name: Pull LFS for batch symbols
+        working-directory: data
+        env:
+          BATCH_TOTAL: ${{ inputs.batch_total || '1' }}
+          BATCH_INDEX: ${{ inputs.batch_index || '0' }}
+        run: |
+          INCLUDES=$(python3 -c "
+          import json, os
+          with open(os.path.join(os.pardir, 'symbols.json'), encoding='utf-8') as f:
+              data = json.load(f)
+          syms = data.get('symbols', [])
+          bt = int(os.environ['BATCH_TOTAL'])
+          bi = int(os.environ['BATCH_INDEX'])
+          chunk = (len(syms) + bt - 1) // bt
+          start = bi * chunk
+          end = start + chunk if bi < bt - 1 else len(syms)
+          for s in syms[start:end]:
+              print(f'--include={s}/**')
+          " | tr '\n' ' ')
+          if [ -n "$INCLUDES" ]; then
+            git lfs pull $INCLUDES 2>&1 || true
+          fi
+          echo "LFS pull done"
 
       # ------------------------------------------------------------------
       # Run the futures updater with periodic auto-push (checkpoints)
