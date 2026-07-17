@@ -31,6 +31,11 @@ on:
         required: false
         default: '300'
         type: string
+      symbols:
+        description: 'Comma-separated symbols to update (e.g. BTCUSDT,ETHUSDT). Leave empty for all.'
+        required: false
+        default: ''
+        type: string
 
 jobs:
   update-futures-dataset:
@@ -144,6 +149,7 @@ jobs:
           BATCH_INDEX: ${{ inputs.batch_index || '0' }}
           PYTHONUNBUFFERED: "1"
           PROXY: ""
+          COINS: ${{ inputs.symbols || '' }}
         run: |
           max_retries=5
           retry=0
