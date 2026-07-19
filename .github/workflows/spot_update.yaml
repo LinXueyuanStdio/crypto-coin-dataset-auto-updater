@@ -110,32 +110,7 @@ jobs:
             exit 0
           fi
 
-          # Pull in chunks of 15 to avoid slow/noisy failures at scale
-          CHUNK=15
-          TOTAL=$BATCH_COUNT
-          OK=0
-          FAIL=0
-          echo "::group::Pulling LFS (${TOTAL} symbols, ${CHUNK}/chunk)"
-          echo "$SYMS" | while IFS= read -r sym; do
-            [ -z "$sym" ] && continue
-            echo -n "  [${CHUNK_INDEX:-?}/${TOTAL}] $sym ... "
-            if git lfs pull --include="${sym}/**" 2>&1 | tail -1; then
-              echo "  ✅ $sym"
-              # track progress (write to temp file since subshell)
-              echo "ok" >> /tmp/lfs_pull_ok.txt
-            else
-              rc=$?
-              echo "  ⚠️  $sym (exit $rc)"
-              echo "fail" >> /tmp/lfs_pull_fail.txt
-            fi
-          done
-          OK=$(wc -l < /tmp/lfs_pull_ok.txt 2>/dev/null || echo 0)
-          FAIL=$(wc -l < /tmp/lfs_pull_fail.txt 2>/dev/null || echo 0)
-          echo "::endgroup::"
-          echo "LFS pull: ${OK}/${TOTAL} ok, ${FAIL} failed"
-          if [ "$FAIL" -gt 0 ]; then
-            echo "⚠️  ${FAIL} symbol(s) failed — updater will fetch fresh data for them"
-          fi
+          echo "$SYMS" | BATCH_COUNT="$BATCH_COUNT" bash "${GITHUB_WORKSPACE}/scripts/pull_lfs.sh" --stdin
 
       # ------------------------------------------------------------------
       # Rebuild _index.json from existing parquet files (fast — reads only time columns)

@@ -116,31 +116,7 @@ jobs:
             exit 0
           fi
 
-          # Pull symbol-by-symbol with progress
-          CHUNK=15
-          rm -f /tmp/lfs_pull_ok.txt /tmp/lfs_pull_fail.txt
-          touch /tmp/lfs_pull_ok.txt /tmp/lfs_pull_fail.txt
-          i=0
-          echo "::group::LFS pull (${BATCH_COUNT} symbols)"
-          echo "$SYMS" | while IFS= read -r sym; do
-            [ -z "$sym" ] && continue
-            i=$((i + 1))
-            echo -n "  [${i}/${BATCH_COUNT}] ${sym} ... "
-            if git lfs pull --include="${sym}/**" 2>&1 | tail -1; then
-              echo "ok" >> /tmp/lfs_pull_ok.txt
-            else
-              rc=$?
-              echo "  ⚠️  ${sym} (exit ${rc})"
-              echo "fail" >> /tmp/lfs_pull_fail.txt
-            fi
-          done
-          OK=$(wc -l < /tmp/lfs_pull_ok.txt 2>/dev/null || echo 0)
-          FAIL=$(wc -l < /tmp/lfs_pull_fail.txt 2>/dev/null || echo 0)
-          echo "::endgroup::"
-          echo "LFS pull: ${OK}/${BATCH_COUNT} ok, ${FAIL} failed"
-          if [ "$FAIL" -gt 0 ]; then
-            echo "⚠️  ${FAIL} symbol(s) failed — updater will fetch fresh data for them"
-          fi
+          echo "$SYMS" | BATCH_COUNT="$BATCH_COUNT" bash "${GITHUB_WORKSPACE}/scripts/pull_lfs.sh" --stdin
 
       # ------------------------------------------------------------------
       # Rebuild _index.json from existing parquet files (fast — reads only time columns)
