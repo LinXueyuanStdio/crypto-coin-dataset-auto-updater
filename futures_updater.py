@@ -2,6 +2,7 @@ import io
 import json
 import os
 import re
+import shutil
 import sys
 import time
 import logging
@@ -74,6 +75,7 @@ FALLBACK_SYMBOLS = [
 
 # Mutable module-level list: starts as the fallback, updated by resolve_symbols().
 SYMBOLS = list(FALLBACK_SYMBOLS)
+SYMBOL_INFOS = {}
 
 
 @dataclass(frozen=True)
@@ -123,6 +125,11 @@ def output_filename(dt, symbol, interval):
     else:
         name = f"{symbol}_{dt.output_suffix}.parquet"
     return f"{symbol}/{name}"
+
+
+def info_filename(symbol):
+    """Return the per-symbol metadata path relative to the data folder root."""
+    return f"{symbol}/{symbol}_info.json"
 
 
 def parse_ym(s):
@@ -326,6 +333,101 @@ def merge_datasets(existing_file, new_file, output_file, time_col):
     return merged
 
 
+def _load_json_file(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (ValueError, OSError):
+        return {}
+
+
+def _write_json_file(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+
+def migrate_symbol_info_files(data_folder, symbols=None):
+    """Move legacy root-level ``{symbol}_info.json`` files into symbol folders."""
+    wanted = set(symbols) if symbols is not None else None
+    moved = 0
+    if not os.path.isdir(data_folder):
+        return moved
+
+    for name in os.listdir(data_folder):
+        match = re.fullmatch(r"(.+)_info\.json", name)
+        if not match:
+            continue
+        symbol = match.group(1)
+        if wanted is not None and symbol not in wanted:
+            continue
+
+        src = os.path.join(data_folder, name)
+        if not os.path.isfile(src):
+            continue
+        dst = os.path.join(data_folder, info_filename(symbol))
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        if os.path.exists(dst):
+            legacy = _load_json_file(src)
+            current = _load_json_file(dst)
+            merged = legacy
+            merged.update(current)
+            _write_json_file(dst, merged)
+            os.remove(src)
+        else:
+            shutil.move(src, dst)
+        moved += 1
+    if moved:
+        logger.info("Migrated %d symbol info files into per-symbol folders", moved)
+    return moved
+
+
+def _normalized_symbol_info(raw):
+    """Flatten Binance exchangeInfo symbol metadata into the dataset shape."""
+    info = {k: v for k, v in raw.items() if k != "filters"}
+    filters = {
+        f.get("filterType"): f
+        for f in raw.get("filters", [])
+        if isinstance(f, dict) and f.get("filterType")
+    }
+
+    price_filter = filters.get("PRICE_FILTER", {})
+    lot_size = filters.get("LOT_SIZE", {})
+    min_notional = filters.get("MIN_NOTIONAL", {})
+
+    for key in ("tickSize", "minPrice"):
+        if key in price_filter:
+            info[key] = price_filter[key]
+    for key in ("minQty", "stepSize"):
+        if key in lot_size:
+            info[key] = lot_size[key]
+    if "notional" in min_notional:
+        info["minNotional"] = min_notional["notional"]
+    elif "minNotional" in min_notional:
+        info["minNotional"] = min_notional["minNotional"]
+
+    return info
+
+
+def refresh_symbol_info_files(data_folder, symbol_infos):
+    """Write current symbol metadata, preserving existing custom fields."""
+    written = 0
+    for symbol, raw in sorted(symbol_infos.items()):
+        if not raw:
+            continue
+        path = os.path.join(data_folder, info_filename(symbol))
+        existing = _load_json_file(path)
+        merged = existing
+        merged.update(_normalized_symbol_info(raw))
+        _write_json_file(path, merged)
+        written += 1
+    if written:
+        logger.info("Refreshed %d symbol info files", written)
+    return written
+
+
 class Budget:
     def __init__(self, minutes):
         self.limit_seconds = float(minutes) * 60.0
@@ -361,6 +463,17 @@ def _parse_binance_symbols(raw_symbols):
     )
 
 
+def _parse_binance_symbol_infos(raw_symbols):
+    infos = {}
+    for item in raw_symbols:
+        if (item.get("quoteAsset") == "USDT"
+                and item.get("contractType") == "PERPETUAL"
+                and item.get("status") == "TRADING"):
+            symbol = item["symbol"].encode("utf-8", errors="surrogatepass").decode("utf-8", errors="replace")
+            infos[symbol] = item
+    return infos
+
+
 def fetch_usdt_perpetual_symbols():
     """Fetch all TRADING USDT-M perpetual symbols from Binance Futures API.
 
@@ -368,6 +481,8 @@ def fetch_usdt_perpetual_symbols():
     Falls back to FALLBACK_SYMBOLS if the API is unreachable or returns no results.
     Results are cached in SYMBOLS_CACHE for SYMBOLS_CACHE_TTL_HOURS.
     """
+    global SYMBOL_INFOS
+
     # ---- check cache first ----
     if os.path.exists(SYMBOLS_CACHE):
         try:
@@ -377,6 +492,8 @@ def fetch_usdt_perpetual_symbols():
             if age < SYMBOLS_CACHE_TTL_HOURS * 3600:
                 symbols = cached.get("symbols", [])
                 if symbols:
+                    infos = cached.get("symbol_infos", {})
+                    SYMBOL_INFOS = infos if isinstance(infos, dict) else {}
                     logger.info(
                         "Using cached symbol list (%d symbols, age=%.1fh)",
                         len(symbols), age / 3600,
@@ -400,8 +517,10 @@ def fetch_usdt_perpetual_symbols():
             resp = SESSION.get(url, timeout=15)
             resp.raise_for_status()
             data = resp.json()
-            symbols = _parse_binance_symbols(data.get("symbols", []))
+            raw_symbols = data.get("symbols", [])
+            symbols = _parse_binance_symbols(raw_symbols)
             symbols.sort()
+            SYMBOL_INFOS = _parse_binance_symbol_infos(raw_symbols)
 
             logger.info(
                 "Fetched %d USDT-M perpetual symbols from %s",
@@ -413,7 +532,11 @@ def fetch_usdt_perpetual_symbols():
                 try:
                     with open(SYMBOLS_CACHE, "w", encoding="utf-8") as f:
                         json.dump(
-                            {"_fetched_at": time.time(), "symbols": symbols},
+                            {
+                                "_fetched_at": time.time(),
+                                "symbols": symbols,
+                                "symbol_infos": SYMBOL_INFOS,
+                            },
                             f, ensure_ascii=False,
                         )
                 except OSError:
@@ -679,6 +802,16 @@ def refresh_readme(path):
         f.write(body)
 
 
+def ensure_readme(path):
+    """Create README.md when missing, using the futures template when available."""
+    if not os.path.exists(path):
+        refresh_readme(path)
+    if not os.path.exists(path):
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"# USDT-M Perpetual Futures Dataset\n\nLast updated on `{now}`\n")
+
+
 def stamp_readme(path):
     """Update only the timestamp in an existing README.md (lightweight)."""
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -923,6 +1056,15 @@ def main():
     # and performs the final HF upload. Non-master batches rely on the
     # auto-push in run_futures_update.sh to checkpoint their data.
     if is_master:
+        migrate_symbol_info_files(data_folder, SYMBOLS)
+        if SYMBOL_INFOS:
+            refresh_symbol_info_files(
+                data_folder,
+                {symbol: info for symbol, info in SYMBOL_INFOS.items() if symbol in SYMBOLS},
+            )
+        else:
+            logger.warning("No exchangeInfo symbol metadata available — skipped info refresh")
+
         readme_path = os.path.join(data_folder, "README.md")
         refresh_readme(readme_path)
 
