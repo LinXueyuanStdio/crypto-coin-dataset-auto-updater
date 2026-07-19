@@ -112,44 +112,19 @@ jobs:
 
           echo "$SYMS" | BATCH_COUNT="$BATCH_COUNT" bash "${GITHUB_WORKSPACE}/scripts/pull_lfs.sh" --stdin
 
+          # Export symbol list so the rebuild step can scope to this batch
+          { echo "BATCH_SYMS<<EOF"; echo "$SYMS"; echo "EOF"; } >> "$GITHUB_ENV"
+
       # ------------------------------------------------------------------
       # Rebuild _index.json from existing parquet files (fast — reads only time columns)
+      # Scoped to BATCH_SYMS (this batch's symbols) when set; full scan otherwise.
       # ------------------------------------------------------------------
       - name: Rebuild _index.json
         if: ${{ inputs.rebuild_index != false }}
         working-directory: data
         run: |
           echo "::group::Rebuilding _index.json from parquet files …"
-          python3 -c "
-          import os, json, time
-          from pathlib import Path
-          import pandas as pd
-
-          idx = {}
-          total = errors = 0
-          t0 = time.monotonic()
-          for root, dirs, files in os.walk('.'):
-              if '.git' in root.split(os.sep):
-                  continue
-              for f in files:
-                  if not f.endswith('.parquet'):
-                      continue
-                  fp = os.path.join(root, f).lstrip('./')
-                  total += 1
-                  try:
-                      df = pd.read_parquet(fp, columns=['open_time'])
-                  except Exception:
-                      errors += 1; continue
-                  if 'open_time' not in df.columns:
-                      continue
-                  ts = pd.to_datetime(df['open_time'], errors='coerce').max()
-                  if pd.notna(ts):
-                      idx[fp] = ts.strftime('%Y-%m-%d %H:%M:%S')
-
-          with open('_index.json', 'w', encoding='utf-8') as out:
-              json.dump(idx, out, indent=0, sort_keys=True, ensure_ascii=False)
-          print(f'Index rebuilt: {len(idx)} entries ({total} files, {errors} errors) in {time.monotonic()-t0:.0f}s')
-          " 2>&1
+          python3 "${GITHUB_WORKSPACE}/scripts/rebuild_index.py" 2>&1
           echo "::endgroup::"
 
       # ------------------------------------------------------------------
