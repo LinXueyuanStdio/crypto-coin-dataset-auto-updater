@@ -23,6 +23,21 @@ Binance **spot** OHLCV klines for USDT trading pairs, auto-updated daily.
 
 Last updated on `pending`
 
+## Usage / 使用
+
+Data is stored as Parquet in per-symbol subdirectories. Files use snake_case column names.
+
+```python
+import pandas as pd
+from datasets import load_dataset
+
+# Load a single kline series
+klines = load_dataset("linxy/CryptoCoin", data_files=["BTCUSDT/BTCUSDT_1d.parquet"], split="train")
+
+# Or read directly with pandas
+df = pd.read_parquet("hf://datasets/linxy/CryptoCoin/BTCUSDT/BTCUSDT_1d.parquet")
+```
+
 ## Quick start / 快速开始
 
 数据集包含大量币种，完整下载体积很大。建议按需下载：
@@ -49,21 +64,6 @@ GIT_LFS_SKIP_SMUDGE=1 git pull origin main
 git lfs pull --include="BTCUSDT/**"
 ```
 
-## Usage / 使用
-
-Data is stored as Parquet in per-symbol subdirectories. Files use snake_case column names.
-
-```python
-import pandas as pd
-from datasets import load_dataset
-
-# Load a single kline series
-klines = load_dataset("linxy/CryptoCoin", data_files=["BTCUSDT/BTCUSDT_1d.parquet"], split="train")
-
-# Or read directly with pandas
-df = pd.read_parquet("hf://datasets/linxy/CryptoCoin/BTCUSDT/BTCUSDT_1d.parquet")
-```
-
 ## File Structure
 
 Files are organized in per-symbol subdirectories:
@@ -78,6 +78,14 @@ ETHUSDT/ETHUSDT_5m.parquet
 ## Intervals / 时间间隔
 
 `1d` `12h` `8h` `6h` `4h` `2h` `1h` `30m` `15m` `5m`
+
+```python
+available_timeframes = [
+    "1m", "3m", "5m", "15m", "30m",
+    "1h", "2h", "4h", "6h", "8h",
+    "12h", "1d"
+]
+```
 
 ## Kline Fields / 字段
 
@@ -96,9 +104,18 @@ ETHUSDT/ETHUSDT_5m.parquet
 | `taker_buy_quote_volume` | Taker buy quote volume |
 | `ignore` | Placeholder (unused) |
 
+```python
+columns = [
+    "Open time", "open", "high", "low", "close", "volume",
+    "Close time", "Quote asset volume",
+    "Number of trades", "Taker buy base asset volume",
+    "Taker buy quote asset volume", "Ignore"
+]
+```
+
 ## Available Symbols / 可用币种
 
-See `_index.json` for the full list. Covers all TRADING spot USDT pairs on Binance.
+{symbol_list}
 
 当前覆盖 {n_symbols} 个币种。
 

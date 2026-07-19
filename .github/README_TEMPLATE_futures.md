@@ -28,6 +28,21 @@ Auto-updated daily from the official [Binance public data mirror](https://data.b
 
 Last updated on `pending`
 
+## Usage
+
+Data is stored as Parquet in per-symbol subdirectories.
+
+```python
+import pandas as pd
+from datasets import load_dataset
+
+# OHLCV klines
+klines = load_dataset("linxy/USDT-M_Perpetual_Futures", data_files=["BTCUSDT/BTCUSDT_1d.parquet"], split="train")
+
+# Or read directly with pandas
+df = pd.read_parquet("hf://datasets/linxy/USDT-M_Perpetual_Futures/BTCUSDT/BTCUSDT_1d.parquet")
+```
+
 ## Quick start / 快速开始
 
 This dataset contains many symbols — a full clone downloads hundreds of GB.
@@ -55,21 +70,6 @@ GIT_LFS_SKIP_SMUDGE=1 git pull origin main
 git lfs pull --include="BTCUSDT/**"
 ```
 
-## Usage
-
-Data is stored as Parquet in per-symbol subdirectories.
-
-```python
-import pandas as pd
-from datasets import load_dataset
-
-# OHLCV klines
-klines = load_dataset("linxy/USDT-M_Perpetual_Futures", data_files=["BTCUSDT/BTCUSDT_1d.parquet"], split="train")
-
-# Or read directly with pandas
-df = pd.read_parquet("hf://datasets/linxy/USDT-M_Perpetual_Futures/BTCUSDT/BTCUSDT_1d.parquet")
-```
-
 ## Data Types
 
 Files are organised in per-symbol subdirectories (`{symbol}/{symbol}_{suffix}.parquet`).
@@ -90,6 +90,14 @@ Files are organised in per-symbol subdirectories (`{symbol}/{symbol}_{suffix}.pa
 
 `1d` `12h` `8h` `6h` `4h` `2h` `1h` `30m` `15m` `5m`
 
+```python
+available_timeframes = [
+    "1m", "3m", "5m", "15m", "30m",
+    "1h", "2h", "4h", "6h", "8h",
+    "12h", "1d"
+]
+```
+
 ## Kline / Price Fields
 
 | Field | Description |
@@ -106,6 +114,15 @@ Files are organised in per-symbol subdirectories (`{symbol}/{symbol}_{suffix}.pa
 | `taker_buy_volume` | Taker buy base volume |
 | `taker_buy_quote_volume` | Taker buy quote volume |
 | `ignore` | Placeholder (unused) |
+
+```python
+columns = [
+    "Open time", "open", "high", "low", "close", "volume",
+    "Close time", "Quote asset volume",
+    "Number of trades", "Taker buy base asset volume",
+    "Taker buy quote asset volume", "Ignore"
+]
+```
 
 ## Metrics Fields
 
@@ -130,15 +147,17 @@ Files are organised in per-symbol subdirectories (`{symbol}/{symbol}_{suffix}.pa
 
 ## Available Symbols
 
-See `meta.json` for the full list.  The dataset covers **all TRADING USDT-M
-perpetual contracts** on Binance Futures (currently {n_symbols} symbols).
+{symbol_list}
+
+The dataset covers **all TRADING USDT-M perpetual contracts** on Binance Futures
+(currently {n_symbols} symbols).
 
 ## Sources
 
 - **Data:** [data.binance.vision](https://data.binance.vision) (Binance public market-data mirror)
 - **Updater:** [GitHub](https://github.com/LinXueyuanStdio/crypto-coin-dataset-auto-updater)
 - **Processing:** Automated daily incremental updates; monthly bulk zips + daily fallback;
-  new data is merged with existing CSVs and de-duplicated by timestamp.
+  new data is merged with existing parquet files and de-duplicated by timestamp.
 
 ## Bias, Risks, and Limitations
 

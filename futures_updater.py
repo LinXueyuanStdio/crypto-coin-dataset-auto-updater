@@ -620,12 +620,43 @@ SYMBOLS_CACHE_TTL_HOURS = 24
 README_TEMPLATE_PATH = os.path.join(BASE_DIR, ".github", "README_TEMPLATE_futures.md")
 
 
-def ensure_readme(path):
-    """Create README.md from .github/README_TEMPLATE_futures.md if it does not exist."""
-    if os.path.exists(path):
-        return
+def _build_symbol_list(index_path):
+    """Build a collapsible markdown symbol list from _index.json keys."""
+    if not os.path.exists(index_path):
+        return "_No _index.json found — run the updater first._"
+    try:
+        with open(index_path, encoding="utf-8") as f:
+            idx = json.load(f)
+    except (ValueError, OSError):
+        return "_Cannot read _index.json._"
+    # Keys are like "BTCUSDT/BTCUSDT_1d.parquet" → extract symbol name
+    symbols = sorted({k.split("/")[0] for k in idx})
+    if not symbols:
+        return "_No symbols in _index.json._"
+    # Format as a Python list, ~5 symbols per line
+    quoted = [f'"{s}"' for s in symbols]
+    rows = []
+    for i in range(0, len(quoted), 5):
+        rows.append("    " + ", ".join(quoted[i:i + 5]) + ("," if i + 5 < len(quoted) else ""))
+    body = "available_pairs = [\n" + "\n".join(rows) + "\n]"
+    return f"""<details>
+<summary>Click to expand — {len(symbols)} symbols / 点击展开</summary>
+
+```python
+{body}
+```
+
+</details>"""
+
+
+def refresh_readme(path):
+    """Always regenerate README.md from .github/README_TEMPLATE_futures.md.
+
+    The template is the source of truth — local README.md is overwritten
+    so that template edits propagate on every master-batch run.
+    """
     if not os.path.exists(README_TEMPLATE_PATH):
-        logger.warning("README_TEMPLATE_futures.md not found — skipping README creation")
+        logger.warning("README_TEMPLATE_futures.md not found — skipping README refresh")
         return
     with open(README_TEMPLATE_PATH, encoding="utf-8") as f:
         body = f.read()
@@ -638,13 +669,22 @@ def ensure_readme(path):
         except (ValueError, OSError, KeyError):
             pass
     body = body.replace("{n_symbols}", str(n))
+    index_path = os.path.join(os.path.dirname(path), "_index.json")
+    body = body.replace("{symbol_list}", _build_symbol_list(index_path))
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    body = body.replace("Last updated on `pending`", f"Last updated on `{now}`")
+    if "Last updated on `" not in body:
+        body += f"\n\nLast updated on `{now}`\n"
     with open(path, "w", encoding="utf-8") as f:
         f.write(body)
 
 
 def stamp_readme(path):
+    """Update only the timestamp in an existing README.md (lightweight)."""
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    ensure_readme(path)
+    if not os.path.exists(path):
+        refresh_readme(path)
+        return
     with open(path, "r", encoding="utf-8") as f:
         body = f.read()
     if "Last updated on `" in body:
@@ -884,8 +924,7 @@ def main():
     # auto-push in run_futures_update.sh to checkpoint their data.
     if is_master:
         readme_path = os.path.join(data_folder, "README.md")
-        ensure_readme(readme_path)
-        stamp_readme(readme_path)
+        refresh_readme(readme_path)
 
         if not os.getenv("HF_TOKEN"):
             logger.warning("HF_TOKEN not set — skipping upload (local dev run)")
