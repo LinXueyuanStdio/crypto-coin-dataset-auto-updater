@@ -81,9 +81,9 @@ ETHUSDT/ETHUSDT_5m.parquet
 
 ```python
 available_timeframes = [
-    "1m", "3m", "5m", "15m", "30m",
-    "1h", "2h", "4h", "6h", "8h",
-    "12h", "1d"
+    "5m", "15m", "30m",
+    "1h", "2h", "4h", "6h", "8h", "12h",
+    "1d"
 ]
 ```
 
@@ -106,10 +106,9 @@ available_timeframes = [
 
 ```python
 columns = [
-    "Open time", "open", "high", "low", "close", "volume",
-    "Close time", "Quote asset volume",
-    "Number of trades", "Taker buy base asset volume",
-    "Taker buy quote asset volume", "Ignore"
+    "open_time", "open", "high", "low", "close", "volume",
+    "close_time", "quote_volume", "count",
+    "taker_buy_volume", "taker_buy_quote_volume", "ignore"
 ]
 ```
 
