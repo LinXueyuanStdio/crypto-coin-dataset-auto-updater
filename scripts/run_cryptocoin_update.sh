@@ -22,7 +22,7 @@ set -euo pipefail
 
 PUSH_INTERVAL_SEC="${PUSH_INTERVAL_SEC:-60}"
 DATA_DIR="${DATA_DIR:-data}"
-UPDATER_SCRIPT="updater.py"
+UPDATER_SCRIPT="spot_updater.py"
 OUTPUT_DIR="${OUTPUT_DIR:-output}"
 LOG_FILE="${LOG_FILE:-${OUTPUT_DIR}/cryptocoin_update.log}"
 COINS="${COINS:-}"

@@ -24,7 +24,7 @@ logger = logging.getLogger("futures_updater")
 # to a local dev proxy for convenience; CI sets PROXY="" to disable it. When
 # set it is applied to BOTH the CDN downloads (this session, via the process
 # env at request time) and the Hugging Face upload (huggingface_hub reads the
-# same env), so a plain `python USDT-M_Perpetual_Futures_updater.py` just works.
+# same env), so a plain `python futures_updater.py` just works.
 PROXY = os.getenv("PROXY", "http://127.0.0.1:4780")
 
 SESSION = requests.Session()
@@ -865,7 +865,7 @@ def main():
     resolve_symbols()
 
     # COINS env var (comma-separated) restricts to a symbol subset.
-    #   e.g. COINS=BTCUSDT,ETHUSDT poetry run python USDT-M_Perpetual_Futures_updater.py
+    #   e.g. COINS=BTCUSDT,ETHUSDT poetry run python futures_updater.py
     coins_filter = os.getenv("COINS", "").strip()
     if coins_filter:
         wanted = {c.strip() for c in coins_filter.split(",") if c.strip()}

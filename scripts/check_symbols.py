@@ -2,7 +2,7 @@
 import importlib.util, json, time, urllib.request, os, sys
 
 base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-spec = importlib.util.spec_from_file_location("updater", os.path.join(base, "USDT-M_Perpetual_Futures_updater.py"))
+spec = importlib.util.spec_from_file_location("updater", os.path.join(base, "futures_updater.py"))
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
 _parse_binance_symbols = mod._parse_binance_symbols

@@ -93,66 +93,17 @@ jobs:
         run: |
           echo "::group::Resolving spot symbols"
 
+          BATCH_PY="${GITHUB_WORKSPACE}/scripts/batch_symbols.py"
           if [ -n "${COINS:-}" ]; then
-            # COINS is set — only pull those specific symbols
-            SYMS=$(echo "$COINS" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$')
+            SYMS=$(python3 "$BATCH_PY" --symbols "$COINS")
             echo "COINS filter: $(echo "$SYMS" | wc -l) symbol(s)"
           else
-            SYMS=$(python3 -c "
-          import os, json, sys
-          FALLBACK = sorted({
-              '1INCHUSDT','AAVEUSDT','ADAUSDT','ALGOUSDT','AVAXUSDT',
-              'BATUSDT','BCHUSDT','BNBUSDT','BTCUSDT','CHZUSDT',
-              'COMPUSDT','CRVUSDT','DOGEUSDT','DOTUSDT','EOSUSDT',
-              'ETCUSDT','ETHUSDT','FILUSDT','FTMUSDT','HBARUSDT',
-              'ICPUSDT','KSMUSDT','LDOUSDT','LINKUSDT','LTCUSDT',
-              'MANAUSDT','MATICUSDT','RUNEUSDT','SANDUSDT','SHIBUSDT',
-              'SNXUSDT','SOLUSDT','SUSHIUSDT','TRXUSDT','UNIUSDT',
-              'WAVESUSDT','XEMUSDT','XLMUSDT','XRPUSDT','YFIUSDT',
-              'ZILUSDT','ZRXUSDT',
-          })
-          syms = []
-          try:
-              import requests
-              for url in [
-                  'https://api.binance.com/api/v3/exchangeInfo',
-                  'https://api-gcp.binance.com/api/v3/exchangeInfo',
-              ]:
-                  resp = requests.get(url, timeout=10)
-                  resp.raise_for_status()
-                  data = resp.json()
-                  syms = sorted(
-                      s['symbol'].encode('utf-8', errors='surrogatepass').decode('utf-8', errors='replace')
-                      for s in data.get('symbols', [])
-                      if s.get('quoteAsset') == 'USDT'
-                      and s.get('status') == 'TRADING'
-                      and 'SPOT' in (s.get('permissions') or [])
-                  )
-                  if syms:
-                      sys.stderr.write(f'# spot API: {len(syms)} symbols\n')
-                      break
-          except Exception as e:
-              sys.stderr.write(f'# spot API failed: {e}\n')
-          if not syms:
-              syms = list(FALLBACK)
-              sys.stderr.write(f'# using fallback: {len(syms)} symbols\n')
-
-          bt = int(os.environ['BATCH_TOTAL'])
-          bi = int(os.environ['BATCH_INDEX'])
-          chunk = (len(syms) + bt - 1) // bt
-          start = bi * chunk
-          end = start + chunk if bi < bt - 1 else len(syms)
-          batch_syms = syms[start:end]
-          for s in batch_syms:
-              print(s)
-          " 2>&1)
+            SYMS=$(python3 "$BATCH_PY" --spot)
+            echo "Batch: ${BATCH_INDEX}/${BATCH_TOTAL}  |  Symbols: $(echo "$SYMS" | wc -l)"
           fi
           BATCH_COUNT=$(echo "$SYMS" | grep -c . 2>/dev/null || echo 0)
           echo "This batch: ${BATCH_COUNT} symbol(s)"
           echo "::endgroup::"
-
-          # Export batch symbols for the wrapper
-          echo "COINS=$(echo "$SYMS" | paste -sd ',')" >> "$GITHUB_ENV"
 
           if [ "$BATCH_COUNT" -eq 0 ]; then
             echo "No symbols to pull — skipping"

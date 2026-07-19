@@ -4,7 +4,7 @@ import pathlib
 
 import pytest
 
-SCRIPT = pathlib.Path(__file__).resolve().parents[1] / "USDT-M_Perpetual_Futures_updater.py"
+SCRIPT = pathlib.Path(__file__).resolve().parents[1] / "futures_updater.py"
 
 
 def _load():

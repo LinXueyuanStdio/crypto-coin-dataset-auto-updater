@@ -99,7 +99,7 @@ available_timeframes = [
 ```sh
 pip install poetry
 poetry install
-python updater.py
+python spot_updater.py
 ```
 
 ## **偏差、风险与局限性**
