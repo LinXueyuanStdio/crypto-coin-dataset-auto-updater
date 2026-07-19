@@ -38,12 +38,12 @@ on:
       rebuild_index:
         description: 'Rebuild _index.json from existing parquet files before running updater'
         required: false
-        default: true
+        default: false
         type: boolean
       squash_history:
         description: 'Squash dataset repo history to a single commit (master batch only)'
         required: false
-        default: true
+        default: false
         type: boolean
 
 jobs:
