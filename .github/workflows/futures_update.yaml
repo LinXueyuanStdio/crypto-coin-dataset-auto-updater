@@ -19,12 +19,12 @@ on:
       fetch_workers:
         description: 'Number of parallel fetch workers (concurrent downloads)'
         required: false
-        default: '64'
+        default: '128'
         type: string
       push_interval_sec:
         description: 'Seconds between auto-push checkpoints (shorter = less data loss on kill)'
         required: false
-        default: '60'
+        default: '120'
         type: string
       max_runtime_min:
         description: 'Soft runtime budget in minutes (updater stops gracefully before the hard timeout)'
@@ -39,12 +39,12 @@ on:
       rebuild_index:
         description: 'Rebuild _index.json from existing parquet files before running updater'
         required: false
-        default: true
+        default: false
         type: boolean
       squash_history:
         description: 'Squash dataset repo history to a single commit (master batch only)'
         required: false
-        default: true
+        default: false
         type: boolean
       force_full_fetch:
         description: 'Ignore _index.json, force full-history fetch for this batch/COINS'
