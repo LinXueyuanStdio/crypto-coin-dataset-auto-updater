@@ -36,6 +36,56 @@ def test_output_filename(fut):
     assert fut.output_filename(fr, "ETHUSDT", None) == "ETHUSDT/ETHUSDT_fundingRate.parquet"
 
 
+def test_info_filename(fut):
+    assert fut.info_filename("BTCUSDT") == "BTCUSDT/BTCUSDT_info.json"
+
+
+def test_migrate_symbol_info_files_moves_flat_files(fut, tmp_path):
+    flat = tmp_path / "BTCUSDT_info.json"
+    flat.write_text('{"symbol":"BTCUSDT","sector":"Store of Value"}', encoding="utf-8")
+
+    moved = fut.migrate_symbol_info_files(str(tmp_path), ["BTCUSDT"])
+
+    nested = tmp_path / "BTCUSDT" / "BTCUSDT_info.json"
+    assert moved == 1
+    assert not flat.exists()
+    assert nested.exists()
+    assert '"sector":"Store of Value"' in nested.read_text(encoding="utf-8")
+
+
+def test_refresh_symbol_info_files_preserves_custom_fields(fut, tmp_path):
+    existing = tmp_path / "BTCUSDT" / "BTCUSDT_info.json"
+    existing.parent.mkdir()
+    existing.write_text(
+        '{"symbol":"BTCUSDT","sector":"Store of Value","tickSize":"0.10","oldOnly":true}',
+        encoding="utf-8",
+    )
+    raw = {
+        "symbol": "BTCUSDT",
+        "baseAsset": "BTC",
+        "quoteAsset": "USDT",
+        "contractType": "PERPETUAL",
+        "onboardDate": 1567965300000,
+        "pricePrecision": 2,
+        "filters": [
+            {"filterType": "PRICE_FILTER", "tickSize": "0.01", "minPrice": "100.00"},
+            {"filterType": "LOT_SIZE", "minQty": "0.001", "stepSize": "0.001"},
+            {"filterType": "MIN_NOTIONAL", "notional": "5"},
+        ],
+    }
+
+    written = fut.refresh_symbol_info_files(str(tmp_path), {"BTCUSDT": raw})
+
+    body = existing.read_text(encoding="utf-8")
+    data = fut.json.loads(body)
+    assert written == 1
+    assert data["sector"] == "Store of Value"
+    assert data["oldOnly"] is True
+    assert data["tickSize"] == "0.01"
+    assert data["minNotional"] == "5"
+    assert "filters" not in data
+
+
 def test_symbols_and_intervals(fut):
     assert "BTCUSDT" in fut.SYMBOLS and "ETHUSDT" in fut.SYMBOLS
     assert fut.INTERVALS[0] == "1d" and "5m" in fut.INTERVALS
