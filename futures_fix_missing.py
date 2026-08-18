@@ -232,6 +232,9 @@ def normalize_funding_file_frame(df: pd.DataFrame) -> pd.DataFrame:
         if col not in work.columns:
             work[col] = pd.NA
     work["calc_time"] = align_funding_time(work["calc_time"])
+    # 统一 funding_interval_hours 为数值：历史 parquet 可能是 str，fetch 是 int，
+    # concat 后变成 object 混合类型，写 parquet 时 pyarrow 会报 ArrowTypeError。
+    work["funding_interval_hours"] = pd.to_numeric(work["funding_interval_hours"], errors="coerce")
     work = work.dropna(subset=["calc_time"])
     work = work.drop_duplicates(subset=["calc_time"], keep="last").sort_values("calc_time")
     return work[FUNDING_COLUMNS].reset_index(drop=True)
@@ -656,7 +659,9 @@ def write_index_entry(data_dir: Path, task: RepairTask, repaired: pd.DataFrame) 
         index = json.loads(index_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return
-    rel = str(task.path.relative_to(data_dir))
+    # as_posix() 保证索引用 "/" 分隔，与 futures_updater.py 的 output_filename 一致。
+    # Windows 上 str(Path) 会产生 "\" 分隔的键，导致索引出现重复/孤儿条目。
+    rel = task.path.relative_to(data_dir).as_posix()
     time_col = task_time_col(task)
     if time_col in repaired.columns and len(repaired):
         last = pd.to_datetime(repaired[time_col], errors="coerce").max()
@@ -777,8 +782,14 @@ def make_fetcher(client: BinanceClient) -> Callable[[RepairTask], pd.DataFrame]:
     return fetch
 
 
+# 与 futures_validate_data.py 对齐的维度命名；修复脚本当前只实现 continuity。
+VALIDATE_DIMENSIONS = ["coverage", "schema", "continuity", "values", "index"]
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--validate", choices=VALIDATE_DIMENSIONS, default="continuity",
+                        help="要修复的维度（与 futures_validate_data.py 对齐；当前仅实现 continuity）")
     parser.add_argument("--data-dir", default="data", help="Data directory, defaults to ./data")
     parser.add_argument("--symbols", help="Comma-separated symbols to scan, e.g. BTCUSDT,ETHUSDT")
     parser.add_argument("--apply", action="store_true", help="Allow approved repairs to write parquet files")
@@ -798,6 +809,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
+    if args.validate != "continuity":
+        print(
+            f"--validate={args.validate} 尚未实现：futures_fix_missing.py 当前仅支持 continuity "
+            f"（修复断档/off-grid/重复时间戳）",
+            file=sys.stderr,
+        )
+        return 2
     api_key, secret_key = configure_environment()
     data_dir = Path(args.data_dir)
     symbols = parse_symbols(args.symbols)

@@ -73,6 +73,14 @@ FALLBACK_SYMBOLS = [
     "YFIUSDT", "ZILUSDT", "ZRXUSDT",
 ]
 
+# Symbols to ignore even when Binance still lists them: delisted pairs whose
+# historical data we no longer maintain, and meme pairs for which Binance does
+# not publish indexPrice/markPrice/premiumIndex klines.
+BLACKLIST_SYMBOLS = {
+    "LUNAUSDT", "MATICUSDT", "WAVESUSDT", "XEMUSDT",
+    "币安人生USDT", "我踏马来了USDT", "龙虾USDT",
+}
+
 # Mutable module-level list: starts as the fallback, updated by resolve_symbols().
 SYMBOLS = list(FALLBACK_SYMBOLS)
 SYMBOL_INFOS = {}
@@ -581,8 +589,12 @@ def resolve_symbols(force_refresh=False):
             os.remove(SYMBOLS_CACHE)
         except OSError:
             pass
-    SYMBOLS = fetch_usdt_perpetual_symbols()
-    logger.info("resolve_symbols: %d symbols loaded", len(SYMBOLS))
+    raw = fetch_usdt_perpetual_symbols()
+    SYMBOLS = [s for s in raw if s not in BLACKLIST_SYMBOLS]
+    skipped = len(raw) - len(SYMBOLS)
+    logger.info(
+        "resolve_symbols: %d symbols loaded (%d blacklisted)", len(SYMBOLS), skipped,
+    )
 
 
 def build_jobs():
