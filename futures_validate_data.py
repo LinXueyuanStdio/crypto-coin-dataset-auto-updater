@@ -49,7 +49,7 @@ from futures_fix_missing import (  # noqa: E402
     interval_freq,
     kline_filename,
     missing_ranges,
-    infer_funding_interval_hours,
+    funding_missing_ranges,
     normalize_kline_file_frame,
     normalize_funding_file_frame,
     normalize_metrics_file_frame,
@@ -386,10 +386,8 @@ def _check_funding_continuity(path, sym):
     df = normalize_funding_file_frame(raw)
     gaps = []
     if not df.empty:
-        hours = infer_funding_interval_hours(df)
-        end = df["calc_time"].max()
-        start = _gap_start_after_onboard(df["calc_time"].min(), _load_onboard_date(path, sym), f"{hours}h")
-        for gs, ge in missing_ranges(df, "calc_time", FUNDING_COLUMNS, start, end, f"{hours}h"):
+        start = _gap_start_after_onboard(df["calc_time"].min(), _load_onboard_date(path, sym), "1h")
+        for gs, ge in funding_missing_ranges(df, start):
             gaps.append({"start": _ts_str(gs), "end": _ts_str(ge)})
     return {"offgrid_count": offgrid, "duplicate_count": dup, "duplicate_times": duplicate_times, "gaps": gaps}
 
@@ -482,12 +480,19 @@ IGNORE_FILENAME = "futures_ignore_continuity.json"
 
 
 def _gap_reason(kind):
-    """按 kind 给出 gap 不可在线修复的原因。"""
+    """按 kind 给出 gap 不可在线补充的原因。
+
+    注意：kline 查不到并非接口保留期限制（历史接口保留期很长），而是币安
+    指数价格（indexPrice/markPrice/premiumIndex）在这些时段本就无数据——
+    多为指数成分调整、币被移出指数，或 meme/小币的指数价格当日被中断。
+    """
     if kind == "metrics":
-        return "metrics 在线接口仅保留 30 天，历史缺失无法在线补"
+        return "metrics 接口仅保留最近 30 天，历史缺失无法在线补"
     if kind == "funding":
-        return "funding 历史缺失超出在线接口保留期"
-    return "kline 历史缺失超出在线接口保留期"
+        return "funding 历史缺失无法在线补"
+    if kind == "ohlcv":
+        return "K线在该时段无成交记录，币安数据源缺失，线上接口返回空"
+    return "币安指数价格在该时段无数据（指数成分调整或币被移出指数，如 meme/小币指数价格当日中断），线上接口返回空"
 
 
 def generate_ignore_file(report_path, output_path):

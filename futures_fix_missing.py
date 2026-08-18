@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Callable
 from urllib.parse import urlencode
 
+import numpy as np
 import pandas as pd
 import requests
 from dotenv import find_dotenv, load_dotenv
@@ -257,20 +258,32 @@ def normalize_funding_file_frame(df: pd.DataFrame) -> pd.DataFrame:
     return work[FUNDING_COLUMNS].reset_index(drop=True)
 
 
-def infer_funding_interval_hours(df: pd.DataFrame, default: int = 8) -> int:
-    if "calc_time" in df.columns:
-        times = pd.to_datetime(df["calc_time"], errors="coerce").dropna().sort_values()
-        diffs = times.diff().dropna()
-        if len(diffs):
-            hours = diffs.dt.total_seconds().div(3600).round().astype(int)
-            hours = hours[hours > 0]
-            if len(hours):
-                return int(hours.mode().iloc[0])
-    if "funding_interval_hours" in df.columns:
-        values = pd.to_numeric(df["funding_interval_hours"], errors="coerce").dropna()
-        if len(values):
-            return int(values.mode().iloc[0])
-    return default
+_STD_FUNDING_HOURS = (1.0, 2.0, 4.0, 8.0)
+
+
+def fill_funding_interval_hours(df: pd.DataFrame) -> pd.DataFrame:
+    """按相邻 calc_time 的实际间隔填充 funding_interval_hours（向前看）。
+
+    币安 /fapi/v1/fundingRate 不返回 interval 字段，且 interval 会随币安调整而
+    变化（8h/4h/1h，非单调，如 8h->4h->1h->4h），故不能硬编码或取众数——那会把
+    切换前的整段标错。逐条用「到下一个 calc_time 的间隔」归一化到标准 funding
+    间隔 {1,2,4,8}：正常相邻差舍入到最近标准值，明显大于 8h 的视为数据缺口，
+    连同最后一条一起用前一条的正常值前向回填（避免把缺口时长误当 interval）。
+    """
+    work = df.copy()
+    if work.empty or "calc_time" not in work.columns:
+        return work
+    work = work.sort_values("calc_time").reset_index(drop=True)
+    t = pd.to_datetime(work["calc_time"], errors="coerce")
+    fwd = (t.shift(-1) - t).dt.total_seconds().div(3600.0).to_numpy()
+    std = np.array(_STD_FUNDING_HOURS)
+    out = np.full(len(fwd), np.nan)
+    ok = (~np.isnan(fwd)) & (fwd > 0) & (fwd <= 8.5)
+    if ok.any():
+        out[ok] = std[np.abs(std[:, None] - fwd[ok]).argmin(axis=0)]
+    out = pd.Series(out).ffill().to_numpy()
+    work["funding_interval_hours"] = pd.array(out, dtype="Int64")
+    return work
 
 
 def normalize_metrics_file_frame(df: pd.DataFrame) -> pd.DataFrame:
@@ -318,8 +331,57 @@ def missing_ranges(
     work = work.dropna(subset=[time_col]).drop_duplicates(subset=[time_col], keep="last")
     work = work.set_index(time_col).sort_index()
     aligned = work.reindex(expected)
-    missing_mask = aligned[required_columns].isna().any(axis=1)
+    # time_col 已 set_index 成索引，不再存在于列中，需从待检查列里剔除，
+    # 否则 aligned[required_columns] 会抛 "not in index"（funding 曾因此误报）。
+    value_cols = [c for c in required_columns if c != time_col]
+    missing_mask = (
+        aligned[value_cols].isna().any(axis=1)
+        if value_cols
+        else pd.Series(False, index=expected)
+    )
     return consecutive_ranges(expected[missing_mask.to_numpy()], freq)
+
+
+def funding_missing_ranges(
+    frame: pd.DataFrame, start: pd.Timestamp | None = None
+) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    """检测 funding 时间缺口（局部异常检测）。
+
+    funding 间隔会动态变化（币安在 8h/4h/1h 之间调整，且非单调），不能套用固定
+    freq 网格，也不能依赖 funding_interval_hours 字段——那会既误报切换、又漏掉
+    缺一个点造成的小缺口。这里直接用相邻 calc_time 的间隔做局部异常检测：某条
+    相邻间隔明显大于其左右邻居（标准间隔的 1.5 倍），就判定其间缺了数据点。
+    返回区间为 [首个缺失点, 下一条存在点)，ge 是恢复点而非缺失点。
+    """
+    work = frame.copy()
+    work["calc_time"] = pd.to_datetime(work["calc_time"], errors="coerce")
+    work = work.dropna(subset=["calc_time"]).sort_values("calc_time").reset_index(drop=True)
+    if len(work) < 3:
+        return []
+    t = work["calc_time"]
+    d = (t.diff().dt.total_seconds() / 3600.0).to_numpy()  # d[i]=t[i]-t[i-1]，d[0]=nan
+    n = len(d)
+    gaps = []
+    for i in range(1, n):
+        h = d[i]
+        if np.isnan(h) or h <= 0:
+            continue
+        left = d[i - 1] if i - 1 >= 1 else np.nan
+        right = d[i + 1] if i + 1 < n else np.nan
+        neighbors = [x for x in (left, right) if not np.isnan(x) and x > 0]
+        if not neighbors:
+            continue
+        local = max(neighbors)
+        if h > local * 1.5:
+            gs = t.iloc[i - 1] + pd.Timedelta(hours=float(local))
+            ge = t.iloc[i]
+            if start is not None:
+                if ge <= start:
+                    continue
+                if gs < start:
+                    gs = start
+            gaps.append((gs, ge))
+    return gaps
 
 
 def plan_kline_repairs(
@@ -605,8 +667,7 @@ def fetch_funding_range(client: BinanceClient, symbol: str, start: pd.Timestamp,
     if not pages:
         return pd.DataFrame(columns=FUNDING_COLUMNS)
     combined = normalize_funding_file_frame(pd.concat(pages, ignore_index=True))
-    combined["funding_interval_hours"] = infer_funding_interval_hours(combined)
-    return combined
+    return fill_funding_interval_hours(combined)
 
 
 def fetch_metrics_range(client: BinanceClient, symbol: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
@@ -692,7 +753,7 @@ def local_context(df: pd.DataFrame, task: RepairTask, time_col: str, context_row
 def merge_repair(existing: pd.DataFrame, fetched: pd.DataFrame, task: RepairTask) -> pd.DataFrame:
     if task.kind == "funding":
         combined = pd.concat([existing, fetched], ignore_index=True)
-        return normalize_funding_file_frame(combined)
+        return fill_funding_interval_hours(normalize_funding_file_frame(combined))
     if task.kind in KLINE_KIND_SPECS:
         combined = pd.concat([existing, fetched], ignore_index=True)
         return normalize_kline_file_frame(combined, interval_from_kline_task(task))
@@ -770,8 +831,6 @@ def apply_repair_task(
     fetched = fetcher(task)
     if task.kind == "funding":
         fetched = normalize_funding_file_frame(fetched)
-        if not fetched.empty:
-            fetched["funding_interval_hours"] = infer_funding_interval_hours(fetched, infer_funding_interval_hours(existing))
     elif task.kind in KLINE_KIND_SPECS:
         fetched = normalize_kline_file_frame(fetched, interval_from_kline_task(task))
     else:
@@ -960,8 +1019,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--validate-report",
                         default=str(Path(__file__).resolve().parent / "output" / "futures_validate_continuity.json"),
                         help="Path to the continuity report JSON to load gaps from (default: output/futures_validate_continuity.json)")
-    parser.add_argument("--min-year", type=int, default=2024,
-                        help="Only repair gaps whose start year is >= this (default 2024; online API is recent-only)")
+    parser.add_argument("--min-year", type=int, default=None,
+                        help="Only repair gaps whose start year is >= this (default: no year filter)")
     parser.add_argument("--min-date", default=None,
                         help="Only repair gaps whose start is >= this date (YYYY-MM-DD); finer than --min-year")
     parser.add_argument("--workers", type=int, default=1,
