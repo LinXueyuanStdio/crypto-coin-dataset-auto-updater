@@ -414,8 +414,10 @@ def _check_metrics_continuity(path, sym):
     return {"offgrid_count": offgrid, "duplicate_count": dup, "duplicate_times": duplicate_times, "gaps": gaps}
 
 
-def validate_continuity(data_dir, symbols_filter):
+def validate_continuity(data_dir, symbols_filter, ignore_file=None):
     report = new_report("continuity", data_dir, symbols_filter)
+
+    ignore = load_ignore_file(ignore_file) if ignore_file else {}
 
     issues = []
     checked = 0
@@ -444,6 +446,10 @@ def validate_continuity(data_dir, symbols_filter):
                                "error": str(exc)[:200]})
                 continue
             gaps = res.get("gaps") or []
+            if ignore:
+                gaps = _filter_ignored_gaps(gaps, ignore.get((sym, fname), []))
+            res = dict(res)
+            res["gaps"] = gaps
             if gaps:
                 with_gaps += 1
                 total_gaps += len(gaps)
@@ -467,6 +473,95 @@ def validate_continuity(data_dir, symbols_filter):
     }
     report["issues"] = issues
     return report
+
+
+# --------------------------------------------------------------------------- #
+# 忽略清单（ignore file）：记录已知不可在线修复的 gap，validate 时跳过
+# --------------------------------------------------------------------------- #
+IGNORE_FILENAME = "futures_ignore_continuity.json"
+
+
+def _gap_reason(kind):
+    """按 kind 给出 gap 不可在线修复的原因。"""
+    if kind == "metrics":
+        return "metrics 在线接口仅保留 30 天，历史缺失无法在线补"
+    if kind == "funding":
+        return "funding 历史缺失超出在线接口保留期"
+    return "kline 历史缺失超出在线接口保留期"
+
+
+def generate_ignore_file(report_path, output_path):
+    """从 continuity 报告生成带 reason 的忽略清单。
+
+    每个有 gap 的文件产出一条 entry，记录 symbol/file/kind/reason 及要忽略的 gap
+    时间范围。下次 validate 读取该清单后，不再把这些 gap 视为缺失。
+    """
+    report = json.loads(Path(report_path).read_text(encoding="utf-8"))
+    entries = []
+    for issue in report.get("issues", []):
+        gaps = issue.get("gaps") or []
+        if not gaps:
+            continue
+        kind = issue.get("kind")
+        entries.append({
+            "symbol": issue.get("symbol"),
+            "file": issue.get("file"),
+            "kind": kind,
+            "reason": _gap_reason(kind),
+            "gaps": gaps,
+        })
+    ignore = {
+        "version": 1,
+        "description": "已知不可在线修复的 continuity gap 忽略清单（validate 时跳过，不再视为缺失）",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "entry_count": len(entries),
+        "entries": entries,
+    }
+    Path(output_path).write_text(
+        json.dumps(ignore, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    return ignore
+
+
+def load_ignore_file(ignore_path):
+    """读取忽略清单，返回 {(symbol, file): [(start, end), ...]} 的映射。
+
+    缺失或损坏时返回空 dict（等价于无忽略）。
+    """
+    p = Path(ignore_path)
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    result = {}
+    for entry in data.get("entries", []):
+        key = (entry.get("symbol"), entry.get("file"))
+        gaps = entry.get("gaps") or []
+        result.setdefault(key, []).extend(
+            (pd.Timestamp(g["start"]), pd.Timestamp(g["end"])) for g in gaps
+        )
+    return result
+
+
+def _filter_ignored_gaps(gaps, ignored):
+    """从 gap 列表中剔除被忽略清单覆盖的 gap。
+
+    gaps: [{"start": str, "end": str}, ...]
+    ignored: [(pd.Timestamp, pd.Timestamp), ...]
+    覆盖判定：存在忽略区间 [is, ie] 使得 gap 完全落在其内。
+    """
+    if not ignored:
+        return gaps
+    kept = []
+    for g in gaps:
+        gs = pd.Timestamp(g["start"])
+        ge = pd.Timestamp(g["end"])
+        if any(is_ <= gs and ge <= ie for is_, ie in ignored):
+            continue
+        kept.append(g)
+    return kept
 
 
 # --------------------------------------------------------------------------- #
@@ -644,11 +739,26 @@ def build_parser():
                         help="报告输出目录，默认 ./output")
     parser.add_argument("--no-live", action="store_true",
                         help="coverage 维度不联网，只用 symbols.json")
+    parser.add_argument("--ignore-file",
+                        default=os.path.join(_BASE_DIR, "output", IGNORE_FILENAME),
+                        help="continuity 维度读取的忽略清单路径")
+    parser.add_argument("--gen-ignore", action="store_true",
+                        help="从现有 continuity 报告生成忽略清单后退出")
     return parser
 
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+
+    if args.gen_ignore:
+        report_path = os.path.join(args.output_dir, f"{OUTPUT_PREFIX}_continuity.json")
+        if not os.path.exists(report_path):
+            print(f"continuity 报告不存在：{report_path}，请先运行 --validate=continuity", file=sys.stderr)
+            return 2
+        ignore = generate_ignore_file(report_path, args.ignore_file)
+        print(f"[gen-ignore] {ignore['entry_count']} entries -> {args.ignore_file}")
+        return 0
+
     symbols = parse_symbols(args.symbols)
     to_run = list(VALIDATOR_FUNCS) if args.validate == "all" else [args.validate]
 
@@ -656,6 +766,8 @@ def main(argv=None):
     for name in to_run:
         if name == "coverage":
             report = VALIDATOR_FUNCS[name](args.data_dir, symbols, live=not args.no_live)
+        elif name == "continuity":
+            report = VALIDATOR_FUNCS[name](args.data_dir, symbols, ignore_file=args.ignore_file)
         else:
             report = VALIDATOR_FUNCS[name](args.data_dir, symbols)
         path = write_report(report, args.output_dir)

@@ -151,3 +151,44 @@ def test_collect_duplicates(v):
     dup2, dup_times2 = v._collect_duplicates(pd.Series(pd.to_datetime(["2026-01-01", "2026-01-02"])))
     assert dup2 == 0
     assert dup_times2 == []
+
+
+def test_generate_and_load_ignore_file(v, tmp_path):
+    report = tmp_path / "continuity.json"
+    report.write_text(
+        v.json.dumps({
+            "issues": [
+                {"symbol": "BTCUSDT", "file": "BTCUSDT_metrics.parquet", "kind": "metrics",
+                 "gaps": [{"start": "2020-01-01T00:00:00", "end": "2026-07-18T23:55:00"}]},
+                {"symbol": "ETHUSDT", "file": "ETHUSDT_indexPrice_1d.parquet", "kind": "indexPrice",
+                 "gaps": [{"start": "2021-01-01T00:00:00", "end": "2021-01-01T00:00:00"}]},
+            ]
+        }, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    ignore_path = tmp_path / "ignore.json"
+    v.generate_ignore_file(report, ignore_path)
+
+    loaded = v.load_ignore_file(ignore_path)
+    assert ("BTCUSDT", "BTCUSDT_metrics.parquet") in loaded
+    assert loaded[("ETHUSDT", "ETHUSDT_indexPrice_1d.parquet")] == [
+        (pd.Timestamp("2021-01-01T00:00:00"), pd.Timestamp("2021-01-01T00:00:00"))
+    ]
+    # 缺失文件 -> 空
+    assert v.load_ignore_file(tmp_path / "nope.json") == {}
+
+
+def test_filter_ignored_gaps(v):
+    gaps = [
+        {"start": "2021-01-01T00:00:00", "end": "2021-01-01T00:00:00"},
+        {"start": "2021-02-01T00:00:00", "end": "2021-02-01T00:00:00"},
+    ]
+    ignored = [(pd.Timestamp("2021-01-01T00:00:00"), pd.Timestamp("2021-01-01T00:00:00"))]
+    assert v._filter_ignored_gaps(gaps, ignored) == [
+        {"start": "2021-02-01T00:00:00", "end": "2021-02-01T00:00:00"}
+    ]
+    # 无忽略 -> 原样
+    assert v._filter_ignored_gaps(gaps, []) == gaps
+    # 忽略区间覆盖多个 gap
+    assert v._filter_ignored_gaps(gaps, [(pd.Timestamp("2021-01-01"), pd.Timestamp("2021-02-01"))]) == []
