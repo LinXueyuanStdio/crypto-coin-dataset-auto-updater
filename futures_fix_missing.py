@@ -8,7 +8,9 @@ import json
 import os
 import shutil
 import sys
+import threading
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -94,6 +96,21 @@ class RepairResult:
     accepted: bool
     wrote: bool
     message: str
+
+
+class Tee:
+    """把写入镜像到多个流（stdout + 日志文件），用于 dry-run 审查落盘。"""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for stream in self.streams:
+            stream.write(data)
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
 
 
 class BinanceClient:
@@ -467,6 +484,49 @@ def plan_metrics_repairs(
     return tasks
 
 
+def plan_repairs_from_report(
+    report_path: Path,
+    data_dir: Path,
+    symbols: list[str] | None = None,
+    kinds: list[str] | None = None,
+    min_year: int | None = None,
+    min_date: pd.Timestamp | None = None,
+) -> list[RepairTask]:
+    """从 futures_validate_data.py 的 continuity 报告加载 gap，构造 RepairTask。
+
+    跳过全量重扫（plan_kline_repairs 对 5m/15m 等高频文件生成巨大的 date_range，
+    需要数十分钟）。报告里已包含每个文件的 gap 起止，直接复用即可。
+
+    ``kinds`` 默认为 KLINE_KIND_SPECS 的键（ohlcv/markPrice/indexPrice/premiumIndex），
+    传 ["funding"] / ["metrics"] 可额外加载对应 gap。
+    """
+    report = json.loads(Path(report_path).read_text(encoding="utf-8"))
+    wanted_kinds = list(kinds) if kinds is not None else list(KLINE_KIND_SPECS)
+    symbol_set = set(symbols) if symbols else None
+    tasks: list[RepairTask] = []
+    for issue in report.get("issues", []):
+        kind = issue.get("kind")
+        if kind not in wanted_kinds:
+            continue
+        symbol = issue.get("symbol")
+        if symbol_set is not None and symbol not in symbol_set:
+            continue
+        fname = issue.get("file")
+        gaps = issue.get("gaps") or []
+        if not fname or not gaps:
+            continue
+        path = data_dir / symbol / fname
+        for gap in gaps:
+            start = pd.Timestamp(gap["start"])
+            end = pd.Timestamp(gap["end"])
+            if min_year is not None and start.year < min_year:
+                continue
+            if min_date is not None and start < pd.Timestamp(min_date):
+                continue
+            tasks.append(RepairTask(kind, symbol, path, start, end, f"missing {kind} rows or values"))
+    return tasks
+
+
 def interval_from_kline_task(task: RepairTask) -> str:
     name = task.path.name
     stem = name[:-len(".parquet")] if name.endswith(".parquet") else Path(name).stem
@@ -782,6 +842,97 @@ def make_fetcher(client: BinanceClient) -> Callable[[RepairTask], pd.DataFrame]:
     return fetch
 
 
+def run_batch_repairs(
+    tasks: list[RepairTask],
+    *,
+    data_dir: Path,
+    workers: int,
+    api_key: str | None,
+    secret_key: str | None,
+    apply: bool = True,
+    backup: bool = True,
+) -> tuple[int, int]:
+    """并发批量修复：按文件分组，读一次、逐个 gap fetch+merge、写一次。
+
+    与串行 apply_repair_task 的区别：不交互、不逐 task 写盘——同一文件的多个 gap
+    合并到内存 DataFrame 后只写一次，避免对同一 parquet 反复 backup/replace。
+
+    返回 ``(写入文件数, 累计修复的 gap 数)``。线程本地持有 BinanceClient，避免
+    并发共享同一个 requests.Session。
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    by_file: dict[Path, list[RepairTask]] = defaultdict(list)
+    for task in tasks:
+        by_file[task.path].append(task)
+
+    _tls = threading.local()
+
+    def get_client() -> BinanceClient:
+        client = getattr(_tls, "client", None)
+        if client is None:
+            client = BinanceClient(api_key=api_key, secret_key=secret_key)
+            _tls.client = client
+        return client
+
+    def process_file(path: Path, file_tasks: list[RepairTask]) -> tuple[str, int, str]:
+        client = get_client()
+        fetcher = make_fetcher(client)
+        try:
+            df = read_parquet(path)
+            orig_rows = len(df)
+        except Exception as exc:
+            return (str(path), 0, f"read_error: {exc}")
+        fixed = 0
+        for task in file_tasks:
+            try:
+                fetched = fetcher(task)
+                if fetched is not None and not fetched.empty:
+                    df = merge_repair(df, fetched, task)
+                    fixed += 1
+            except Exception:
+                continue
+        if fixed <= 0 or len(df) < orig_rows:
+            return (str(path), fixed, "no_data_or_row_shrink")
+        if not apply:
+            return (str(path), fixed, "dry_run")
+
+        stamp = f"{time.strftime('%Y%m%d-%H%M%S')}-{time.time_ns()}"
+        tmp_path = path.with_name(f"{path.name}.tmp-{stamp}")
+        try:
+            if backup:
+                shutil.copy2(path, path.with_name(f"{path.name}.bak-{stamp}"))
+            df.to_parquet(tmp_path, index=False)
+            os.replace(tmp_path, path)
+        except Exception as exc:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+            return (str(path), fixed, f"write_error: {exc}")
+        # 同一文件的所有 task 共享同一 rel key 与时间列，取首个即可。
+        write_index_entry(data_dir, file_tasks[0], df)
+        return (str(path), fixed, "ok")
+
+    written = 0
+    total_fixed = 0
+    total = len(by_file)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = [ex.submit(process_file, path, ts) for path, ts in by_file.items()]
+        for i, fut in enumerate(as_completed(futs), 1):
+            _, fixed, msg = fut.result()
+            total_fixed += fixed
+            if msg == "ok":
+                written += 1
+            if i % 200 == 0 or i == total:
+                print(
+                    f"progress: {i}/{total} files, fixed {total_fixed} gaps, "
+                    f"{written} files written",
+                    flush=True,
+                )
+    return written, total_fixed
+
+
 # 与 futures_validate_data.py 对齐的维度命名；修复脚本当前只实现 continuity。
 VALIDATE_DIMENSIONS = ["coverage", "schema", "continuity", "values", "index"]
 
@@ -804,6 +955,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-premium-index", action="store_true", help="Do not scan premiumIndex kline files")
     parser.add_argument("--skip-funding", action="store_true", help="Do not scan fundingRate files")
     parser.add_argument("--skip-metrics", action="store_true", help="Do not scan metrics files")
+    parser.add_argument("--force-validate-data", action="store_true",
+                        help="Force full re-scan (plan_*_repairs) instead of loading gaps from the continuity report")
+    parser.add_argument("--validate-report",
+                        default=str(Path(__file__).resolve().parent / "output" / "futures_validate_continuity.json"),
+                        help="Path to the continuity report JSON to load gaps from (default: output/futures_validate_continuity.json)")
+    parser.add_argument("--min-year", type=int, default=2024,
+                        help="Only repair gaps whose start year is >= this (default 2024; online API is recent-only)")
+    parser.add_argument("--min-date", default=None,
+                        help="Only repair gaps whose start is >= this date (YYYY-MM-DD); finer than --min-year")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Concurrent repair workers; >1 uses run_batch_repairs (batch, non-interactive)")
+    parser.add_argument("--dry-run-log", default=None,
+                        help="dry-run（不 --apply）时把逐 gap 审查详情镜像到这个日志文件，便于核对时间/数值")
+    parser.add_argument("--no-backup", action="store_true",
+                        help="批量写入时不生成 .bak 备份（省磁盘；数据仓库本身有版本控制保护）")
     return parser
 
 
@@ -823,7 +989,6 @@ def main(argv: list[str] | None = None) -> int:
     if intervals:
         intervals = [interval.lower() for interval in intervals]
 
-    tasks = []
     kline_kinds = []
     if not args.skip_ohlcv:
         kline_kinds.append("ohlcv")
@@ -833,17 +998,79 @@ def main(argv: list[str] | None = None) -> int:
         kline_kinds.append("indexPrice")
     if not args.skip_premium_index:
         kline_kinds.append("premiumIndex")
-    if kline_kinds:
-        tasks.extend(plan_kline_repairs(data_dir, symbols, intervals=intervals, kinds=kline_kinds))
+    kinds = list(kline_kinds)
     if not args.skip_funding:
-        tasks.extend(plan_funding_repairs(data_dir, symbols))
+        kinds.append("funding")
     if not args.skip_metrics:
-        tasks.extend(plan_metrics_repairs(data_dir, symbols))
+        kinds.append("metrics")
+
+    if args.force_validate_data:
+        tasks = []
+        if kline_kinds:
+            tasks.extend(plan_kline_repairs(data_dir, symbols, intervals=intervals, kinds=kline_kinds))
+        if not args.skip_funding:
+            tasks.extend(plan_funding_repairs(data_dir, symbols))
+        if not args.skip_metrics:
+            tasks.extend(plan_metrics_repairs(data_dir, symbols))
+    else:
+        report_path = Path(args.validate_report)
+        if not report_path.exists():
+            print(
+                f"连续性报告不存在：{report_path}\n"
+                f"请先运行 futures_validate_data.py --validate=continuity 生成，"
+                f"或用 --force-validate-data 强制重新检测。",
+                file=sys.stderr,
+            )
+            return 2
+        min_date = pd.Timestamp(args.min_date) if args.min_date else None
+        tasks = plan_repairs_from_report(report_path, data_dir, symbols, kinds, args.min_year, min_date)
+
     tasks.sort(key=lambda t: (t.kind, t.symbol, str(t.start), str(t.end)))
     if args.max_tasks and args.max_tasks > 0:
         tasks = tasks[: args.max_tasks]
     print_task_summary(tasks)
     if not tasks:
+        return 0
+
+    # dry-run 审查：串行逐 gap 打印时间/数值（本地上下文 + fetch 候选 + 合并预览），
+    # 镜像到日志文件供核对。不写盘。
+    if args.dry_run_log and not args.apply:
+        client = BinanceClient(api_key=api_key, secret_key=secret_key)
+        fetcher = make_fetcher(client)
+        _stdout = sys.stdout
+        with open(args.dry_run_log, "w", encoding="utf-8") as _log_fh:
+            sys.stdout = Tee(_stdout, _log_fh)
+            try:
+                for task in tasks:
+                    result = apply_repair_task(
+                        task,
+                        data_dir=data_dir,
+                        fetcher=fetcher,
+                        prompt=lambda _: "n",
+                        apply=False,
+                        context_rows=args.context_rows,
+                        auto_accept=False,
+                    )
+                    print(result.message)
+            finally:
+                sys.stdout = _stdout
+        print(f"dry-run 审查日志已写入：{args.dry_run_log}")
+        return 0
+
+    # 并发批量路径：非交互，同一文件读一次/写一次；写盘受 --apply 门控。
+    if args.workers > 1:
+        if not args.apply:
+            print("批量并发模式需要 --apply 才会写入；当前为 dry-run（仅 fetch 并统计可修复数）。")
+        written, total_fixed = run_batch_repairs(
+            tasks,
+            data_dir=data_dir,
+            workers=args.workers,
+            api_key=api_key,
+            secret_key=secret_key,
+            apply=bool(args.apply),
+            backup=not args.no_backup,
+        )
+        print(f"batch done: {written} files written, {total_fixed} gaps fixed")
         return 0
 
     client = BinanceClient(api_key=api_key, secret_key=secret_key)

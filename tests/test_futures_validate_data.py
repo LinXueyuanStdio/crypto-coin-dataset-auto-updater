@@ -103,3 +103,51 @@ def test_validate_coverage_symbols_filter_scopes_missing(v, tmp_path, monkeypatc
     assert report["summary"]["live_symbol_count"] == 1
     assert report["summary"]["disk_symbol_count"] == 1
     assert report["summary"]["missing_symbol_count"] == 0
+
+
+def test_load_onboard_date(v, tmp_path):
+    sym_dir = tmp_path / "BTCUSDT"
+    sym_dir.mkdir()
+    (sym_dir / "BTCUSDT_info.json").write_text(
+        v.json.dumps({"onboardDate": 1567965300000}), encoding="utf-8"
+    )
+    path = sym_dir / "BTCUSDT_1d.parquet"
+    onboard = v._load_onboard_date(path, "BTCUSDT")
+    assert onboard == pd.Timestamp(1567965300000, unit="ms")
+
+    # 无 info.json -> None
+    missing_dir = tmp_path / "ETHUSDT"
+    missing_dir.mkdir()
+    assert v._load_onboard_date(missing_dir / "ETHUSDT_1d.parquet", "ETHUSDT") is None
+
+
+def test_gap_start_after_onboard(v):
+    # 数据最早时间晚于上市日期：沿用数据最早时间
+    assert v._gap_start_after_onboard(
+        pd.Timestamp("2025-06-01"), pd.Timestamp("2025-05-01"), "1D"
+    ) == pd.Timestamp("2025-06-01")
+    # 上市前有占位数据：起点抬升到上市日期（对齐网格）
+    assert v._gap_start_after_onboard(
+        pd.Timestamp("2020-01-01"), pd.Timestamp("2025-05-16 08:30"), "15min"
+    ) == pd.Timestamp("2025-05-16 08:30")
+    # 无上市日期：沿用数据最早时间
+    assert v._gap_start_after_onboard(
+        pd.Timestamp("2020-01-01"), None, "1D"
+    ) == pd.Timestamp("2020-01-01")
+
+
+def test_collect_duplicates(v):
+    floor_time = pd.Series(pd.to_datetime([
+        "2026-01-01", "2026-01-01", "2026-01-02", "2026-01-02", "2026-01-02", "2026-01-03",
+    ]))
+    dup, dup_times = v._collect_duplicates(floor_time)
+    # 01-01 出现 2 次（多余 1），01-02 出现 3 次（多余 2），共 3 个多余重复行
+    assert dup == 3
+    by_time = {d["time"]: d["count"] for d in dup_times}
+    assert by_time["2026-01-01T00:00:00"] == 2
+    assert by_time["2026-01-02T00:00:00"] == 3
+
+    # 无重复
+    dup2, dup_times2 = v._collect_duplicates(pd.Series(pd.to_datetime(["2026-01-01", "2026-01-02"])))
+    assert dup2 == 0
+    assert dup_times2 == []

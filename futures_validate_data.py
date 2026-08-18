@@ -303,6 +303,55 @@ def validate_schema(data_dir, symbols_filter):
 # --------------------------------------------------------------------------- #
 # 维度 3：continuity
 # --------------------------------------------------------------------------- #
+def _load_onboard_date(path, sym):
+    """读取 symbol 的上市日期（info.json 的 onboardDate，毫秒时间戳）。
+
+    返回 naive UTC 的 pd.Timestamp；info 缺失 / 无 onboardDate / 解析失败时返回 None。
+    上市日期之前本就没有行情数据，continuity 校验据此不把上市前空档算作 gap。
+    """
+    info_path = path.parent / f"{sym}_info.json"
+    if not info_path.exists():
+        return None
+    try:
+        info = json.loads(info_path.read_text(encoding="utf-8"))
+        onboard = info.get("onboardDate")
+        if onboard is None:
+            return None
+        return pd.to_datetime(int(onboard), unit="ms", utc=True).tz_localize(None)
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _gap_start_after_onboard(data_min, onboard, freq):
+    """gap 检测的起点：不早于上市日期（对齐到 freq 网格）。
+
+    数据可能包含上市前的占位/指数价格（volume=0），但它们不应参与 gap 判定；
+    只有上市日期之后的真实断档才算 gap。
+    """
+    if onboard is None or pd.isna(onboard):
+        return data_min
+    onboard_grid = pd.Timestamp(onboard).floor(freq)
+    return max(data_min, onboard_grid)
+
+
+def _collect_duplicates(floor_time):
+    """统计 floor 后的时间戳重复，返回 (重复行数, 重复明细)。
+
+    重复行数是多余的重复行（不含每组第一个）；重复明细列出重复次数最多的前 20 个
+    时间戳及其出现次数，避免报告无限膨胀。
+    """
+    dup = int(floor_time.duplicated().sum())
+    duplicate_times = []
+    if dup > 0:
+        counts = floor_time.dropna().value_counts()
+        repeated = counts[counts > 1]
+        duplicate_times = [
+            {"time": _ts_str(t), "count": int(c)}
+            for t, c in repeated.head(20).items()
+        ]
+    return dup, duplicate_times
+
+
 def _check_kline_continuity(path, sym, kind, interval):
     raw = pd.read_parquet(path)
     if "open_time" not in raw.columns:
@@ -312,15 +361,16 @@ def _check_kline_continuity(path, sym, kind, interval):
     raw_time = pd.to_datetime(raw["open_time"], errors="coerce")
     floor_time = raw_time.dt.floor(freq)
     offgrid = int(raw_time.ne(floor_time).sum())
-    dup = int(floor_time.duplicated().sum())
+    dup, duplicate_times = _collect_duplicates(floor_time)
 
     df = normalize_kline_file_frame(raw, interval)
     gaps = []
     if not df.empty:
-        start, end = df["open_time"].min(), df["open_time"].max()
+        end = df["open_time"].max()
+        start = _gap_start_after_onboard(df["open_time"].min(), _load_onboard_date(path, sym), freq)
         for gs, ge in missing_ranges(df, "open_time", KLINE_REQUIRED_COLUMNS, start, end, freq):
             gaps.append({"start": _ts_str(gs), "end": _ts_str(ge)})
-    return {"offgrid_count": offgrid, "duplicate_count": dup, "gaps": gaps}
+    return {"offgrid_count": offgrid, "duplicate_count": dup, "duplicate_times": duplicate_times, "gaps": gaps}
 
 
 def _check_funding_continuity(path, sym):
@@ -331,16 +381,17 @@ def _check_funding_continuity(path, sym):
     raw_time = pd.to_datetime(raw["calc_time"], errors="coerce")
     floor_time = raw_time.dt.floor("s")
     offgrid = int(raw_time.ne(floor_time).sum())
-    dup = int(floor_time.duplicated().sum())
+    dup, duplicate_times = _collect_duplicates(floor_time)
 
     df = normalize_funding_file_frame(raw)
     gaps = []
     if not df.empty:
         hours = infer_funding_interval_hours(df)
-        start, end = df["calc_time"].min(), df["calc_time"].max()
+        end = df["calc_time"].max()
+        start = _gap_start_after_onboard(df["calc_time"].min(), _load_onboard_date(path, sym), f"{hours}h")
         for gs, ge in missing_ranges(df, "calc_time", FUNDING_COLUMNS, start, end, f"{hours}h"):
             gaps.append({"start": _ts_str(gs), "end": _ts_str(ge)})
-    return {"offgrid_count": offgrid, "duplicate_count": dup, "gaps": gaps}
+    return {"offgrid_count": offgrid, "duplicate_count": dup, "duplicate_times": duplicate_times, "gaps": gaps}
 
 
 def _check_metrics_continuity(path, sym):
@@ -351,15 +402,16 @@ def _check_metrics_continuity(path, sym):
     raw_time = pd.to_datetime(raw["create_time"], errors="coerce")
     floor_time = raw_time.dt.floor("5min")
     offgrid = int(raw_time.ne(floor_time).sum())
-    dup = int(floor_time.duplicated().sum())
+    dup, duplicate_times = _collect_duplicates(floor_time)
 
     df = normalize_metrics_file_frame(raw)
     gaps = []
     if not df.empty:
-        start, end = df["create_time"].min(), df["create_time"].max()
+        end = df["create_time"].max()
+        start = _gap_start_after_onboard(df["create_time"].min(), _load_onboard_date(path, sym), "5min")
         for gs, ge in missing_ranges(df, "create_time", METRICS_NUMERIC_COLUMNS, start, end, "5min"):
             gaps.append({"start": _ts_str(gs), "end": _ts_str(ge)})
-    return {"offgrid_count": offgrid, "duplicate_count": dup, "gaps": gaps}
+    return {"offgrid_count": offgrid, "duplicate_count": dup, "duplicate_times": duplicate_times, "gaps": gaps}
 
 
 def validate_continuity(data_dir, symbols_filter):
@@ -369,6 +421,8 @@ def validate_continuity(data_dir, symbols_filter):
     checked = 0
     with_gaps = 0
     total_gaps = 0
+    with_duplicates = 0
+    total_duplicates = 0
 
     for sym_dir in iter_symbol_dirs(data_dir, symbols_filter):
         sym = sym_dir.name
@@ -393,6 +447,10 @@ def validate_continuity(data_dir, symbols_filter):
             if gaps:
                 with_gaps += 1
                 total_gaps += len(gaps)
+            dup = res.get("duplicate_count") or 0
+            if dup:
+                with_duplicates += 1
+                total_duplicates += dup
             if res.get("offgrid_count") or res.get("duplicate_count") or gaps:
                 issues.append({
                     "symbol": sym, "file": fname, "kind": kind, "interval": interval,
@@ -404,6 +462,8 @@ def validate_continuity(data_dir, symbols_filter):
         "files_with_issues": len(issues),
         "files_with_gaps": with_gaps,
         "total_gap_count": total_gaps,
+        "files_with_duplicates": with_duplicates,
+        "total_duplicate_count": total_duplicates,
     }
     report["issues"] = issues
     return report

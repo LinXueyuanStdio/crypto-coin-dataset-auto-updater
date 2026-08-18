@@ -1,5 +1,6 @@
 import importlib.util
 import builtins
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -375,7 +376,154 @@ def test_yes_flag_applies_without_prompting(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(builtins, "input", lambda _: (_ for _ in ()).throw(AssertionError("prompted")))
 
-    rc = fix.main(["--data-dir", str(tmp_path), "--apply", "--yes"])
+    rc = fix.main(["--data-dir", str(tmp_path), "--apply", "--yes", "--force-validate-data"])
 
     assert rc == 0
     assert pd.read_parquet(path)["last_funding_rate"].tolist() == ["0.0002"]
+
+
+def test_plan_repairs_from_report_loads_and_filters(tmp_path):
+    fix = load_module()
+    report = tmp_path / "continuity.json"
+    report.write_text(
+        json.dumps(
+            {
+                "issues": [
+                    {"symbol": "BTCUSDT", "file": "BTCUSDT_1d.parquet", "kind": "ohlcv", "interval": "1d",
+                     "gaps": [{"start": "2026-01-03T00:00:00", "end": "2026-01-03T00:00:00"}]},
+                    {"symbol": "BTCUSDT", "file": "BTCUSDT_markPrice_1d.parquet", "kind": "markPrice", "interval": "1d",
+                     "gaps": [{"start": "2023-06-01T00:00:00", "end": "2023-06-01T00:00:00"}]},
+                    {"symbol": "ETHUSDT", "file": "ETHUSDT_1d.parquet", "kind": "ohlcv", "interval": "1d",
+                     "gaps": [{"start": "2026-01-05T00:00:00", "end": "2026-01-05T00:00:00"}]},
+                    {"symbol": "BTCUSDT", "file": "BTCUSDT_fundingRate.parquet", "kind": "funding",
+                     "gaps": [{"start": "2026-01-03T00:00:00", "end": "2026-01-03T00:00:00"}]},
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    # 默认只加载 kline kinds（funding 被排除），min_year=2024 过滤掉 2023 的 markPrice gap
+    tasks = fix.plan_repairs_from_report(report, tmp_path, min_year=2024)
+    assert len(tasks) == 2
+    assert all(t.kind in fix.KLINE_KIND_SPECS for t in tasks)
+
+    # symbols 过滤
+    tasks_btc = fix.plan_repairs_from_report(report, tmp_path, symbols=["BTCUSDT"], min_year=2024)
+    assert len(tasks_btc) == 1
+    assert tasks_btc[0].symbol == "BTCUSDT"
+    assert tasks_btc[0].path == tmp_path / "BTCUSDT" / "BTCUSDT_1d.parquet"
+
+    # kinds 可显式包含 funding
+    tasks_funding = fix.plan_repairs_from_report(report, tmp_path, kinds=["funding"], min_year=2024)
+    assert len(tasks_funding) == 1
+    assert tasks_funding[0].kind == "funding"
+
+
+def _write_kline(path, days):
+    rows = []
+    for day in days:
+        ts = pd.Timestamp(f"2026-01-{day:02d}")
+        rows.append({
+            "open_time": ts,
+            "open": "100", "high": "110", "low": "90", "close": "105",
+            "volume": "1",
+            "close_time": ts + pd.Timedelta("1D") - pd.Timedelta("1ms"),
+            "quote_volume": "1", "count": "1",
+            "taker_buy_volume": "1", "taker_buy_quote_volume": "1", "ignore": "0",
+        })
+    pd.DataFrame(rows).to_parquet(path, index=False)
+
+
+def test_run_batch_repairs_writes_merged_gap(tmp_path, monkeypatch):
+    fix = load_module()
+    sym_dir = tmp_path / "BTCUSDT"
+    sym_dir.mkdir()
+    path = sym_dir / "BTCUSDT_1d.parquet"
+    _write_kline(path, [1, 2, 4])  # 缺 1 月 3 日
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get(self, endpoint, params, *, signed=False):
+            ts = int(pd.Timestamp("2026-01-03").timestamp() * 1000)
+            return [[ts, "108", "118", "104", "112", "1", ts + 86399000, "1", 1, "1", "1", "0"]]
+
+    monkeypatch.setattr(fix, "BinanceClient", FakeClient)
+
+    task = fix.RepairTask(
+        "ohlcv", "BTCUSDT", path,
+        pd.Timestamp("2026-01-03"), pd.Timestamp("2026-01-03"), "missing ohlcv 1d rows",
+    )
+    written, fixed = fix.run_batch_repairs(
+        [task], data_dir=tmp_path, workers=2, api_key=None, secret_key=None, apply=True
+    )
+
+    assert written == 1
+    assert fixed == 1
+    out = pd.read_parquet(path)
+    assert len(out) == 4
+    assert pd.Timestamp("2026-01-03") in pd.to_datetime(out["open_time"]).tolist()
+
+
+def test_run_batch_repairs_dry_run_does_not_write(tmp_path, monkeypatch):
+    fix = load_module()
+    sym_dir = tmp_path / "BTCUSDT"
+    sym_dir.mkdir()
+    path = sym_dir / "BTCUSDT_1d.parquet"
+    _write_kline(path, [1, 2, 4])
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get(self, endpoint, params, *, signed=False):
+            ts = int(pd.Timestamp("2026-01-03").timestamp() * 1000)
+            return [[ts, "108", "118", "104", "112", "1", ts + 86399000, "1", 1, "1", "1", "0"]]
+
+    monkeypatch.setattr(fix, "BinanceClient", FakeClient)
+
+    task = fix.RepairTask(
+        "ohlcv", "BTCUSDT", path,
+        pd.Timestamp("2026-01-03"), pd.Timestamp("2026-01-03"), "missing ohlcv 1d rows",
+    )
+    written, fixed = fix.run_batch_repairs(
+        [task], data_dir=tmp_path, workers=2, api_key=None, secret_key=None, apply=False
+    )
+
+    assert written == 0
+    assert fixed == 1  # 能 fetch 到并 merge，但不落盘
+    assert len(pd.read_parquet(path)) == 3
+
+
+def test_run_batch_repairs_no_backup(tmp_path, monkeypatch):
+    fix = load_module()
+    sym_dir = tmp_path / "BTCUSDT"
+    sym_dir.mkdir()
+    path = sym_dir / "BTCUSDT_1d.parquet"
+    _write_kline(path, [1, 2, 4])
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get(self, endpoint, params, *, signed=False):
+            ts = int(pd.Timestamp("2026-01-03").timestamp() * 1000)
+            return [[ts, "108", "118", "104", "112", "1", ts + 86399000, "1", 1, "1", "1", "0"]]
+
+    monkeypatch.setattr(fix, "BinanceClient", FakeClient)
+    task = fix.RepairTask(
+        "ohlcv", "BTCUSDT", path,
+        pd.Timestamp("2026-01-03"), pd.Timestamp("2026-01-03"), "missing ohlcv 1d rows",
+    )
+    written, fixed = fix.run_batch_repairs(
+        [task], data_dir=tmp_path, workers=2, api_key=None, secret_key=None,
+        apply=True, backup=False,
+    )
+
+    assert written == 1
+    assert fixed == 1
+    assert len(pd.read_parquet(path)) == 4
+    assert not list(tmp_path.rglob("*.bak-*"))  # 无备份文件
