@@ -484,7 +484,8 @@ def _gap_reason(kind):
 
     注意：kline 查不到并非接口保留期限制（历史接口保留期很长），而是币安
     指数价格（indexPrice/markPrice/premiumIndex）在这些时段本就无数据——
-    多为指数成分调整、币被移出指数，或 meme/小币的指数价格当日被中断。
+    多为币安指数/标记价格当日全局中断（同一时刻影响多数币），或指数成分调整、
+    币被移出指数。
     """
     if kind == "metrics":
         return "metrics 接口仅保留最近 30 天，历史缺失无法在线补"
@@ -492,7 +493,7 @@ def _gap_reason(kind):
         return "funding 历史缺失无法在线补"
     if kind == "ohlcv":
         return "K线在该时段无成交记录，币安数据源缺失，线上接口返回空"
-    return "币安指数价格在该时段无数据（指数成分调整或币被移出指数，如 meme/小币指数价格当日中断），线上接口返回空"
+    return "币安指数/标记价格在该时段无数据（指数成分调整、币被移出指数，或币安当日全局中断指数/标记价格推送），线上接口返回空"
 
 
 def generate_ignore_file(report_path, output_path):
