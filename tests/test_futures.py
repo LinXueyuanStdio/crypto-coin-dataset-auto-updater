@@ -86,6 +86,58 @@ def test_refresh_symbol_info_files_preserves_custom_fields(fut, tmp_path):
     assert "filters" not in data
 
 
+def test_refresh_symbol_info_files_merges_leverage_brackets(fut, tmp_path):
+    existing = tmp_path / "SCRUSDT" / "SCRUSDT_info.json"
+    existing.parent.mkdir()
+    existing.write_text(
+        '{"symbol":"SCRUSDT","requiredMarginPercent":"5.0000"}',
+        encoding="utf-8",
+    )
+    raw = {"symbol": "SCRUSDT", "requiredMarginPercent": "5.0000"}
+    brackets = {
+        "SCRUSDT": {
+            "maxLeverage": 10,
+            "leverageBrackets": [
+                {"bracket": 1, "initialLeverage": 10, "maintMarginRatio": 0.05},
+                {"bracket": 2, "initialLeverage": 5, "maintMarginRatio": 0.10},
+            ],
+        }
+    }
+
+    written = fut.refresh_symbol_info_files(
+        str(tmp_path), {"SCRUSDT": raw}, leverage_brackets=brackets
+    )
+
+    data = fut.json.loads(existing.read_text(encoding="utf-8"))
+    assert written == 1
+    assert data["requiredMarginPercent"] == "5.0000"  # 旧字段保留（兼容）
+    assert data["maxLeverage"] == 10
+    assert len(data["leverageBrackets"]) == 2
+    assert data["leverageBrackets"][0]["initialLeverage"] == 10
+
+
+def test_parse_leverage_brackets_takes_first_bracket(fut):
+    raw_brackets = [
+        {"symbol": "SCRUSDT", "brackets": [
+            {"bracket": 1, "initialLeverage": 10, "maintMarginRatio": 0.05},
+            {"bracket": 2, "initialLeverage": 5, "maintMarginRatio": 0.10},
+        ]},
+        {"symbol": "BTCUSDT", "brackets": [
+            {"bracket": 1, "initialLeverage": 150, "maintMarginRatio": 0.004},
+        ]},
+        {"symbol": "EMPTYUSDT", "brackets": []},
+        {"no_brackets": True},
+    ]
+
+    result = fut._parse_leverage_brackets(raw_brackets)
+
+    assert result["SCRUSDT"]["maxLeverage"] == 10
+    assert result["BTCUSDT"]["maxLeverage"] == 150
+    assert len(result["SCRUSDT"]["leverageBrackets"]) == 2
+    assert "EMPTYUSDT" not in result
+    assert "no_brackets" not in result
+
+
 def test_symbols_and_intervals(fut):
     assert "BTCUSDT" in fut.SYMBOLS and "ETHUSDT" in fut.SYMBOLS
     assert fut.INTERVALS[0] == "1d" and "5m" in fut.INTERVALS

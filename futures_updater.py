@@ -6,6 +6,8 @@ import shutil
 import sys
 import time
 import logging
+import hashlib
+import hmac
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 
@@ -84,6 +86,7 @@ BLACKLIST_SYMBOLS = {
 # Mutable module-level list: starts as the fallback, updated by resolve_symbols().
 SYMBOLS = list(FALLBACK_SYMBOLS)
 SYMBOL_INFOS = {}
+LEVERAGE_BRACKETS = {}
 
 
 @dataclass(frozen=True)
@@ -99,6 +102,7 @@ class DataType:
     floor: str
     output_suffix: str
     enabled: bool = True
+    numeric_cols: tuple = ()
 
 
 DATA_TYPES = [
@@ -113,7 +117,8 @@ DATA_TYPES = [
     DataType("metrics", "metrics", False, False, True, "create_time",
              (), tuple(METRICS_COLUMNS), "2021-01", "metrics"),
     DataType("fundingRate", "fundingRate", False, True, False, "calc_time",
-             ("calc_time",), tuple(FUNDING_COLUMNS), "2020-01", "fundingRate"),
+             ("calc_time",), tuple(FUNDING_COLUMNS), "2020-01", "fundingRate",
+             numeric_cols=("funding_interval_hours", "last_funding_rate")),
 ]
 
 
@@ -227,6 +232,13 @@ def normalize_times(df, dt):
         df[col] = pd.to_datetime(pd.to_numeric(df[col], errors="coerce"), unit="ms")
     if dt.time_col not in dt.ms_time_cols:
         df[dt.time_col] = pd.to_datetime(df[dt.time_col], errors="coerce")
+    # read_zip_csv 用 dtype=str 读所有列，数值列也成了字符串。磁盘上大多数
+    # 数据类型的数值列本就是 string（历史遗留），保持字符串即可与磁盘一致；
+    # 只有显式声明 numeric_cols 的列（funding 的 funding_interval_hours /
+    # last_funding_rate）磁盘上是数值类型，需转回数值，否则合并时类型冲突。
+    for col in dt.numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
 
 
@@ -419,8 +431,15 @@ def _normalized_symbol_info(raw):
     return info
 
 
-def refresh_symbol_info_files(data_folder, symbol_infos):
-    """Write current symbol metadata, preserving existing custom fields."""
+def refresh_symbol_info_files(data_folder, symbol_infos, leverage_brackets=None):
+    """Write current symbol metadata, preserving existing custom fields.
+
+    ``leverage_brackets`` (optional) is the ``{symbol: {maxLeverage,
+    leverageBrackets}}`` map from :func:`fetch_leverage_brackets`. When
+    present, it is merged in so info.json carries the real (tiered) leverage
+    instead of relying on exchangeInfo's static ``requiredMarginPercent``
+    default.
+    """
     written = 0
     for symbol, raw in sorted(symbol_infos.items()):
         if not raw:
@@ -429,6 +448,10 @@ def refresh_symbol_info_files(data_folder, symbol_infos):
         existing = _load_json_file(path)
         merged = existing
         merged.update(_normalized_symbol_info(raw))
+        lb = (leverage_brackets or {}).get(symbol)
+        if lb:
+            merged["maxLeverage"] = lb["maxLeverage"]
+            merged["leverageBrackets"] = lb["leverageBrackets"]
         _write_json_file(path, merged)
         written += 1
     if written:
@@ -575,6 +598,101 @@ def fetch_usdt_perpetual_symbols():
         len(FALLBACK_SYMBOLS),
     )
     return list(FALLBACK_SYMBOLS)
+
+
+def _parse_leverage_brackets(raw_brackets):
+    """Map the leverageBracket payload to ``{symbol: {maxLeverage, leverageBrackets}}``.
+
+    The first bracket is the lowest-notional tier and carries the highest
+    allowed leverage (``initialLeverage``). Binance's exchangeInfo
+    ``requiredMarginPercent`` is a static default ("5.0000" -> 20x) and does
+    NOT reflect real per-symbol leverage; the signed /fapi/v1/leverageBracket
+    endpoint is authoritative, and it is tiered (逐仓分层), so we preserve the
+    full bracket list rather than collapsing it to a single number.
+    """
+    result = {}
+    for item in raw_brackets:
+        if not isinstance(item, dict):
+            continue
+        symbol = item.get("symbol")
+        brackets = item.get("brackets") or []
+        if not symbol or not brackets:
+            continue
+        try:
+            max_lev = int(brackets[0]["initialLeverage"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        result[symbol] = {
+            "maxLeverage": max_lev,
+            "leverageBrackets": brackets,
+        }
+    return result
+
+
+def fetch_leverage_brackets(force_refresh=False):
+    """Fetch per-symbol leverage brackets from the signed Binance API.
+
+    Returns ``{symbol: {"maxLeverage": int, "leverageBrackets": [...]}}``.
+    Cached on disk for SYMBOLS_CACHE_TTL_HOURS. Requires BINANCE_API_KEY and
+    BINANCE_SECRET_KEY (used only to sign the request — their values are never
+    logged). Returns ``{}`` when credentials are absent or the API fails, in
+    which case callers simply skip writing leverage fields.
+    """
+    global LEVERAGE_BRACKETS
+
+    if not force_refresh and os.path.exists(LEVERAGE_BRACKETS_CACHE):
+        try:
+            with open(LEVERAGE_BRACKETS_CACHE, encoding="utf-8") as f:
+                cached = json.load(f)
+            age = time.time() - cached.get("_fetched_at", 0)
+            if age < SYMBOLS_CACHE_TTL_HOURS * 3600:
+                brackets = cached.get("leverage_brackets", {})
+                if brackets:
+                    LEVERAGE_BRACKETS = brackets
+                    logger.info(
+                        "Using cached leverage brackets (%d symbols, age=%.1fh)",
+                        len(brackets), age / 3600,
+                    )
+                    return brackets
+        except (ValueError, OSError, KeyError, TypeError):
+            pass
+
+    api_key = os.getenv("BINANCE_API_KEY", "").strip()
+    secret = os.getenv("BINANCE_SECRET_KEY", "").strip()
+    if not api_key or not secret:
+        logger.warning(
+            "BINANCE_API_KEY/BINANCE_SECRET_KEY not set — skipped leverage brackets"
+        )
+        return {}
+
+    ts = int(time.time() * 1000)
+    query = f"timestamp={ts}"
+    signature = hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+    url = f"https://fapi.binance.com/fapi/v1/leverageBracket?{query}&signature={signature}"
+    try:
+        resp = SESSION.get(url, timeout=15, headers={"X-MBX-APIKEY": api_key})
+        resp.raise_for_status()
+        data = resp.json()
+        if not isinstance(data, list):
+            logger.warning("Unexpected leverageBracket response shape: %r", data)
+            return {}
+        LEVERAGE_BRACKETS = _parse_leverage_brackets(data)
+        logger.info("Fetched leverage brackets for %d symbols", len(LEVERAGE_BRACKETS))
+        try:
+            with open(LEVERAGE_BRACKETS_CACHE, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "_fetched_at": time.time(),
+                        "leverage_brackets": LEVERAGE_BRACKETS,
+                    },
+                    f, ensure_ascii=False,
+                )
+        except OSError:
+            pass
+        return LEVERAGE_BRACKETS
+    except Exception as e:
+        logger.warning("Failed to fetch leverage brackets: %s", e)
+        return {}
 
 
 def resolve_symbols(force_refresh=False):
@@ -751,6 +869,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SYMBOLS_CACHE = os.path.join(BASE_DIR, ".symbols_cache.json")
 SYMBOLS_FILE = os.path.join(BASE_DIR, "symbols.json")
 SYMBOLS_CACHE_TTL_HOURS = 24
+LEVERAGE_BRACKETS_CACHE = os.path.join(BASE_DIR, ".leverage_brackets_cache.json")
 
 README_TEMPLATE_PATH = os.path.join(BASE_DIR, ".github", "README_TEMPLATE_futures.md")
 
@@ -1070,9 +1189,11 @@ def main():
     if is_master:
         migrate_symbol_info_files(data_folder, SYMBOLS)
         if SYMBOL_INFOS:
+            leverage_brackets = fetch_leverage_brackets()
             refresh_symbol_info_files(
                 data_folder,
                 {symbol: info for symbol, info in SYMBOL_INFOS.items() if symbol in SYMBOLS},
+                leverage_brackets=leverage_brackets,
             )
         else:
             logger.warning("No exchangeInfo symbol metadata available — skipped info refresh")

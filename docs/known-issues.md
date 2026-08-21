@@ -105,6 +105,36 @@ ATOM/AAVE/ADA/ALGO 等主流币的 gap 列表几乎一模一样。币安源头�
 
 ---
 
+## 7. `requiredMarginPercent` / `maintMarginPercent` 是静态默认值，不能算杠杆
+
+**现象**：info.json 里 `requiredMarginPercent` 几乎全是 `"5.0000"`（→ 20x），
+`maintMarginPercent` 全是 `"2.5000"`。但币安后来把 SCRUSDT 最高杠杆从 20x 降到 10x，
+这个字段没变，策略据此算 `max_lev = 100/5 = 20x` 会高估杠杆。
+
+**根因**：这两个字段来自 `/fapi/v1/exchangeInfo`，而币安在这个接口里对几乎所有
+USDT-M 永续都**硬编码静态默认值**（`requiredMarginPercent="5.0000"`、
+`maintMarginPercent="2.5000"`），**从不随杠杆调整更新**。实测 527 个 TRADING 永续里
+473 个（约 90%）用 `100/requiredMarginPercent` 推算的杠杆与真实杠杆不符：
+BTC/ETH 真实 150x、XRP 100x、BCH/LTC/ADA 等 75x、SCR 10x，但 info.json 全是 20x。
+
+**事实**：真实杠杆在 `/fapi/v1/leverageBracket`（需 API key + HMAC 签名），且是
+**逐仓分层**的 brackets（如 SCR：10x/5x/4x/3x/2x/1x 六档），不是单一数字。维持保证金率
+（`maintMarginRatio`）同样分层，exchangeInfo 的 `maintMarginPercent` 也是静态默认值。
+
+**修复**：`futures_updater.py` 新增 `fetch_leverage_brackets()`，签名调用
+`leverageBracket` 并在 master batch 里把结果写进每个 symbol 的 info.json：
+- `maxLeverage`：第一档 `initialLeverage`（最高杠杆）
+- `leverageBrackets`：完整分层数组（含 `initialLeverage` / `maintMarginRatio`）
+
+旧的 `requiredMarginPercent` / `maintMarginPercent` 字段保留（兼容），但**不可靠**，
+策略层应改用 `maxLeverage`（或从 `leverageBrackets` 取分层保证金率）。
+
+**教训**：exchangeInfo 的 `requiredMarginPercent` / `maintMarginPercent` 是静态默认值，
+和 `onboardDate`（#5）一样属于「快照/默认值」而非实时数据；真实的杠杆/保证金率
+要用签名接口 `leverageBracket` 获取。
+
+---
+
 ## 附：忽略清单机制
 
 `output/futures_ignore_continuity.json` 记录所有「已知不可在线补」的 gap（带 reason）。
