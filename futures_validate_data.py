@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Validate Binance USDT-M perpetual futures parquet data (read-only).
 
-五个维度的独立体检，每个维度产出一个 JSON 报告，**不修改任何数据文件**：
+七个维度的独立体检，每个维度产出一个 JSON 报告，**不修改任何数据文件**：
 
     coverage    文件覆盖率——对照 Binance 实时 symbol 列表，核对每个 symbol
                 应存在的 43 个文件是否齐全（缺/多文件、缺/残留 symbol）。
@@ -10,6 +10,10 @@
     continuity  时间连续性——时间戳是否对齐 interval 网格、是否重复、区间内
                 是否断档。
     values      数值合理性——OHLC 关系、非负、NaN。
+    outliers    异常值/尖峰——滚动 MAD z-score 检测价格与资金费率的孤立尖峰
+                （闪崩、插针等，数据本身合法但统计上极端）。
+    halt        休市信息——生成 futures_halt_periods.json（下架冻结期 + 成交
+                K 线缺失的维护期），供回测引擎跳过不可交易时段。
     index       _index.json 一致性——索引键与磁盘文件双向核对、时间戳漂移。
 
 复用 futures_fix_missing.py 的检测逻辑（missing_ranges / normalize_* /
@@ -19,7 +23,7 @@ futures_updater.py 的 fetch_usdt_perpetual_symbols() 获取实时 symbol 列表
 用法：
 
     python futures_validate_data.py --validate=coverage --symbols BTCUSDT,ETHUSDT
-    python futures_validate_data.py --validate=all                 # 全量 5 个维度
+    python futures_validate_data.py --validate=all                 # 全量 7 个维度
     python futures_validate_data.py --validate=schema --no-live     # 覆盖维度不联网
 """
 
@@ -31,6 +35,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 
@@ -58,8 +63,9 @@ from futures_updater import fetch_usdt_perpetual_symbols, BLACKLIST_SYMBOLS  # n
 
 INDEX_FILENAME = "_index.json"
 NON_SYMBOL_DIRS = {".git", ".claude", ".github"}
-VALIDATORS = ("coverage", "schema", "continuity", "values", "index")
+VALIDATORS = ("coverage", "schema", "continuity", "values", "outliers", "halt", "index")
 OUTPUT_PREFIX = "futures_validate"
+HALT_FILENAME = "futures_halt_periods.json"
 
 
 # --------------------------------------------------------------------------- #
@@ -716,6 +722,268 @@ def validate_index(data_dir, symbols_filter):
 
 
 # --------------------------------------------------------------------------- #
+# 维度 6：outliers（异常值/尖峰）
+# --------------------------------------------------------------------------- #
+def _rolling_mad_z(series, window):
+    """滚动 MAD z-score（中心窗口）。
+
+    返回与 series 等长的 z 值序列。MAD 为 0（窗口内数值恒定）时 z 为 NaN，
+    该处不判定为尖峰——低流动性币大部分收益为 0，MAD 恒 0 时无法用相对离散
+    衡量，宁可不报也不误报。
+    """
+    s = pd.Series(series, dtype="float64")
+    med = s.rolling(window, center=True, min_periods=max(5, window // 4)).median()
+    mad = (s - med).abs().rolling(window, center=True, min_periods=max(5, window // 4)).median()
+    z = 0.6745 * (s - med) / mad.replace(0, np.nan)
+    return z
+
+
+def _spike_return(close, kind):
+    """按 kind 计算用于尖峰检测的收益序列。"""
+    close = pd.to_numeric(close, errors="coerce")
+    if kind == "premiumIndex":
+        # 溢价率可为负且接近 0，log return 无意义，用绝对差分
+        return close.diff()
+    # 价格类：log return，clip 下界避免 log(0)/负值
+    return np.log(close.clip(lower=1e-12)).diff()
+
+
+def _check_outliers_kline(path, kind, window, threshold):
+    df = pd.read_parquet(path, columns=["open_time", "close"])
+    if df.empty or "close" not in df.columns:
+        return {"spike_count": 0, "spikes": [], "note": "missing close column"}
+    t = pd.to_datetime(df["open_time"], errors="coerce")
+    close = pd.to_numeric(df["close"], errors="coerce")
+    ret = _spike_return(close, kind)
+    z = _rolling_mad_z(ret, window)
+    mask = z.abs() > threshold
+    idxs = np.where(mask.to_numpy())[0]
+    spikes = [
+        {
+            "time": _ts_str(t.iloc[i]),
+            "value": round(float(close.iloc[i]), 12),
+            "return": round(float(ret.iloc[i]), 12),
+            "zscore": round(float(z.iloc[i]), 2),
+        }
+        for i in idxs
+    ]
+    return {"spike_count": int(len(idxs)), "spikes": spikes[:50]}
+
+
+def _check_outliers_funding(path, window, threshold):
+    df = pd.read_parquet(path, columns=["calc_time", "last_funding_rate"])
+    if df.empty or "last_funding_rate" not in df.columns:
+        return {"spike_count": 0, "spikes": [], "note": "missing last_funding_rate column"}
+    t = pd.to_datetime(df["calc_time"], errors="coerce")
+    rate = pd.to_numeric(df["last_funding_rate"], errors="coerce")
+    z = _rolling_mad_z(rate, window)
+    mask = z.abs() > threshold
+    idxs = np.where(mask.to_numpy())[0]
+    spikes = [
+        {
+            "time": _ts_str(t.iloc[i]),
+            "value": round(float(rate.iloc[i]), 12),
+            "zscore": round(float(z.iloc[i]), 2),
+        }
+        for i in idxs
+    ]
+    return {"spike_count": int(len(idxs)), "spikes": spikes[:50]}
+
+
+def validate_outliers(data_dir, symbols_filter, window=121, threshold=10.0):
+    report = new_report("outliers", data_dir, symbols_filter)
+
+    issues = []
+    checked = 0
+    with_spikes = 0
+    total_spikes = 0
+    by_kind = Counter()
+
+    for sym_dir in iter_symbol_dirs(data_dir, symbols_filter):
+        sym = sym_dir.name
+        for fname in iter_symbol_parquets(sym_dir):
+            path = sym_dir / fname
+            kind, interval = classify_file(fname)
+            if kind not in KLINE_KIND_SPECS and kind != "funding":
+                continue
+            checked += 1
+            try:
+                if kind == "funding":
+                    res = _check_outliers_funding(path, window, threshold)
+                    interval = None
+                else:
+                    res = _check_outliers_kline(path, kind, window, threshold)
+            except Exception as exc:
+                issues.append({"symbol": sym, "file": fname, "kind": kind,
+                               "error": str(exc)[:200]})
+                continue
+            n = res.get("spike_count") or 0
+            if n:
+                with_spikes += 1
+                total_spikes += n
+                by_kind[kind] += n
+                issues.append({
+                    "symbol": sym, "file": fname, "kind": kind, "interval": interval,
+                    "spike_count": n,
+                    "spikes": res.get("spikes") or [],
+                })
+
+    report["summary"] = {
+        "files_checked": checked,
+        "files_with_spikes": with_spikes,
+        "total_spike_count": total_spikes,
+        "by_kind": dict(by_kind),
+        "params": {"window": window, "threshold": threshold},
+    }
+    report["issues"] = issues
+    return report
+
+
+# --------------------------------------------------------------------------- #
+# 维度 7：halt（休市信息，供回测引擎跳过不可交易时段）
+# --------------------------------------------------------------------------- #
+def _detect_frozen_periods(path, sym, min_days=2):
+    """从 ohlcv 1d K 线检测下架冻结期。
+
+    冻结判据：连续 (volume==0 且 high==low) 的天段——下架后币安用零成交、
+    价格冻结的占位记录填充（见 docs/known-issues.md #5），不是数据缺失。
+
+    只检测「首个真实成交（volume>0）之后」的冻结段：数据起点的零成交段是
+    上市前占位，不算下架。不能用 onboardDate 过滤——对下架后重新上线的币，
+    onboardDate 是「重新上线日」，下架冻结期恰恰落在它之前，会被误排除。
+    段长 < min_days 的忽略，避免小币单日偶然零成交的噪声。
+
+    返回 [(start, end), ...]，闭区间：start/end 均为冻结日的 open_time。
+    """
+    try:
+        df = pd.read_parquet(path, columns=["open_time", "high", "low", "volume"])
+    except Exception:
+        return []
+    if df.empty or "volume" not in df.columns:
+        return []
+    t = pd.to_datetime(df["open_time"], errors="coerce").to_numpy()
+    vol = pd.to_numeric(df["volume"], errors="coerce").to_numpy()
+    high = pd.to_numeric(df["high"], errors="coerce").to_numpy()
+    low = pd.to_numeric(df["low"], errors="coerce").to_numpy()
+
+    frozen = (vol == 0) & (high == low)
+    traded = vol > 0
+    if not traded.any():
+        return []  # 全程零成交，整体为占位，无下架冻结
+    first_traded = int(np.argmax(traded))
+
+    n = len(frozen)
+    periods = []
+    i = 0
+    while i < n:
+        if frozen[i] and i >= first_traded:
+            j = i
+            while j < n and frozen[j]:
+                j += 1
+            start, end = t[i], t[j - 1]
+            if (end - start) >= pd.Timedelta(days=min_days):
+                periods.append((pd.Timestamp(start), pd.Timestamp(end)))
+            i = j
+        else:
+            i += 1
+    return periods
+
+
+def _load_ohlcv_gaps(ignore_file):
+    """从忽略清单提取 ohlcv（成交 K 线）kind 的 gap 作为维护期。
+
+    忽略清单由 --gen-ignore 从 continuity 报告生成，记录已知不可在线补的 gap。
+    其中 ohlcv kind 的 gap 表示成交 K 线缺失（交易所维护/宕机/无成交记录），
+    回测时该时段无成交数据、不可交易。返回 [(symbol, start, end), ...]。
+    """
+    if not ignore_file:
+        return []
+    p = Path(ignore_file)
+    if not p.exists():
+        return []
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    out = []
+    for entry in data.get("entries", []):
+        if entry.get("kind") != "ohlcv":
+            continue
+        sym = entry.get("symbol")
+        for g in entry.get("gaps") or []:
+            out.append((sym, g.get("start"), g.get("end")))
+    return out
+
+
+def validate_halt(data_dir, symbols_filter, ignore_file=None, min_days=2):
+    report = {
+        "version": 1,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "description": (
+            "休市/不可交易时段清单，供回测引擎跳过。periods 里每个时段的 "
+            "start/end 为闭区间（两端都不可交易），bar 的 open_time 落在 "
+            "[start, end] 内即视为休市。type=frozen 为下架冻结期（连续零成交、"
+            "价格冻结）；type=missing 为成交 K 线缺失（交易所维护/宕机）。"
+        ),
+        "data_dir": str(Path(data_dir).resolve()),
+        "symbols_filter": sorted(symbols_filter) if symbols_filter else None,
+        "periods": [],
+        "summary": {},
+    }
+
+    frozen_periods = []
+    missing_periods = []
+    syms_with_frozen = set()
+    syms_with_missing = set()
+
+    # frozen：读每个 symbol 的 ohlcv 1d K 线
+    for sym_dir in iter_symbol_dirs(data_dir, symbols_filter):
+        sym = sym_dir.name
+        path = sym_dir / f"{sym}_1d.parquet"
+        if not path.exists():
+            continue
+        for s, e in _detect_frozen_periods(path, sym, min_days=min_days):
+            frozen_periods.append({
+                "symbol": sym, "type": "frozen",
+                "start": _ts_str(s), "end": _ts_str(e),
+                "reason": "下架冻结期（连续零成交、价格冻结）",
+            })
+            syms_with_frozen.add(sym)
+
+    # missing：从忽略清单提取 ohlcv gap
+    wanted = set(symbols_filter) if symbols_filter is not None else None
+    for sym, gs, ge in _load_ohlcv_gaps(ignore_file):
+        if wanted is not None and sym not in wanted:
+            continue
+        missing_periods.append({
+            "symbol": sym, "type": "missing",
+            "start": gs, "end": ge,
+            "reason": "成交 K 线缺失（交易所维护/宕机）",
+        })
+        syms_with_missing.add(sym)
+
+    report["periods"] = frozen_periods + missing_periods
+    report["summary"] = {
+        "frozen_period_count": len(frozen_periods),
+        "missing_period_count": len(missing_periods),
+        "total_period_count": len(report["periods"]),
+        "symbols_with_frozen": len(syms_with_frozen),
+        "symbols_with_missing": len(syms_with_missing),
+        "min_days": min_days,
+    }
+    return report
+
+
+def write_halt_report(report, output_dir):
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / HALT_FILENAME
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2, ensure_ascii=False, default=str)
+    return path
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 VALIDATOR_FUNCS = {
@@ -723,6 +991,8 @@ VALIDATOR_FUNCS = {
     "schema": validate_schema,
     "continuity": validate_continuity,
     "values": validate_values,
+    "outliers": validate_outliers,
+    "halt": validate_halt,
     "index": validate_index,
 }
 
@@ -747,9 +1017,15 @@ def build_parser():
                         help="coverage 维度不联网，只用 symbols.json")
     parser.add_argument("--ignore-file",
                         default=os.path.join(_BASE_DIR, "output", IGNORE_FILENAME),
-                        help="continuity 维度读取的忽略清单路径")
+                        help="continuity 维度读取的忽略清单路径；halt 维度据此提取 ohlcv 缺口")
     parser.add_argument("--gen-ignore", action="store_true",
                         help="从现有 continuity 报告生成忽略清单后退出")
+    parser.add_argument("--outlier-window", type=int, default=121,
+                        help="outliers 维度滚动 MAD 窗口（中心窗口，默认 121）")
+    parser.add_argument("--outlier-threshold", type=float, default=10.0,
+                        help="outliers 维度尖峰 z-score 阈值（默认 10）")
+    parser.add_argument("--min-days", type=int, default=2,
+                        help="halt 维度下架冻结期最小天数（默认 2）")
     return parser
 
 
@@ -774,6 +1050,19 @@ def main(argv=None):
             report = VALIDATOR_FUNCS[name](args.data_dir, symbols, live=not args.no_live)
         elif name == "continuity":
             report = VALIDATOR_FUNCS[name](args.data_dir, symbols, ignore_file=args.ignore_file)
+        elif name == "outliers":
+            report = VALIDATOR_FUNCS[name](args.data_dir, symbols,
+                                           window=args.outlier_window,
+                                           threshold=args.outlier_threshold)
+        elif name == "halt":
+            report = VALIDATOR_FUNCS[name](args.data_dir, symbols,
+                                           ignore_file=args.ignore_file,
+                                           min_days=args.min_days)
+            path = write_halt_report(report, args.output_dir)
+            paths.append(path)
+            print(f"[halt] -> {path}")
+            print(f"    {json.dumps(report['summary'], ensure_ascii=False, default=str)}")
+            continue
         else:
             report = VALIDATOR_FUNCS[name](args.data_dir, symbols)
         path = write_report(report, args.output_dir)

@@ -1,6 +1,8 @@
 import importlib.util
+import json
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -192,3 +194,128 @@ def test_filter_ignored_gaps(v):
     assert v._filter_ignored_gaps(gaps, []) == gaps
     # 忽略区间覆盖多个 gap
     assert v._filter_ignored_gaps(gaps, [(pd.Timestamp("2021-01-01"), pd.Timestamp("2021-02-01"))]) == []
+
+
+# --------------------------------------------------------------------------- #
+# outliers 维度
+# --------------------------------------------------------------------------- #
+def test_rolling_mad_z_flags_spike(v):
+    rng = np.random.default_rng(42)
+    base = rng.normal(0, 0.01, 300)
+    s = pd.Series(np.concatenate([base[:150], [0.5], base[150:]]))
+    z = v._rolling_mad_z(s, 121)
+    assert abs(z.iloc[150]) > 10
+    # 平稳段 z 应远小于阈值
+    assert (z.iloc[10:140].abs() < 10).all()
+
+
+def test_validate_outliers_detects_price_spike(v, tmp_path):
+    sym_dir = tmp_path / "BTCUSDT"
+    sym_dir.mkdir()
+    times = pd.date_range("2024-01-01", periods=300, freq="1h")
+    rng = np.random.default_rng(7)
+    close = 100 + rng.normal(0, 0.5, 300).cumsum()
+    close[150] = 1000.0  # 孤立尖峰
+    df = pd.DataFrame({"open_time": times, "close": close})
+    df.to_parquet(sym_dir / "BTCUSDT_1h.parquet", index=False)
+
+    report = v.validate_outliers(str(tmp_path), None, window=61, threshold=10.0)
+
+    assert report["summary"]["files_checked"] == 1
+    assert report["summary"]["total_spike_count"] >= 1
+    issue = report["issues"][0]
+    assert issue["kind"] == "ohlcv"
+    spike_times = [s["time"] for s in issue["spikes"]]
+    # close[150]=1000 的收益体现在 index 150（上涨）与 151（回落）两处
+    assert "2024-01-07T06:00:00" in spike_times  # index 150
+    assert "2024-01-07T07:00:00" in spike_times  # index 151
+
+
+def test_validate_outliers_skips_non_kline(v, tmp_path):
+    sym_dir = tmp_path / "BTCUSDT"
+    sym_dir.mkdir()
+    # 只有 funding 文件时也能跑（funding 纳入检查）
+    f = pd.DataFrame({"calc_time": pd.date_range("2024-01-01", periods=200, freq="8h"),
+                      "last_funding_rate": np.full(200, 0.0001)})
+    f.to_parquet(sym_dir / "BTCUSDT_fundingRate.parquet", index=False)
+    report = v.validate_outliers(str(tmp_path), None)
+    assert report["summary"]["files_checked"] == 1
+    assert report["summary"]["files_with_spikes"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# halt 维度
+# --------------------------------------------------------------------------- #
+def test_detect_frozen_periods(v, tmp_path):
+    sym_dir = tmp_path / "TESTUSDT"
+    sym_dir.mkdir()
+    # 上市前占位(2天) + 交易(3天) + 下架冻结(3天) + 恢复交易(2天)
+    times = pd.date_range("2024-01-01", periods=10, freq="1D")
+    vol = [0, 0, 100, 200, 300, 0, 0, 0, 400, 500]
+    high = [10, 10, 12, 13, 14, 9, 9, 9, 15, 16]
+    low = [10, 10, 11, 12, 13, 9, 9, 9, 14, 15]
+    df = pd.DataFrame({"open_time": times, "high": high, "low": low, "volume": vol})
+    path = sym_dir / "TESTUSDT_1d.parquet"
+    df.to_parquet(path, index=False)
+
+    periods = v._detect_frozen_periods(path, "TESTUSDT", min_days=2)
+
+    # 只报下架冻结期（index 5..7），上市前占位（index 0..1）被排除
+    assert len(periods) == 1
+    assert periods[0] == (pd.Timestamp("2024-01-06"), pd.Timestamp("2024-01-08"))
+
+
+def test_detect_frozen_periods_min_days_filter(v, tmp_path):
+    sym_dir = tmp_path / "TESTUSDT"
+    sym_dir.mkdir()
+    times = pd.date_range("2024-01-01", periods=5, freq="1D")
+    vol = [100, 0, 200, 300, 400]  # 仅 1 天零成交
+    high = [12, 9, 13, 14, 15]
+    low = [11, 9, 12, 13, 14]
+    df = pd.DataFrame({"open_time": times, "high": high, "low": low, "volume": vol})
+    path = sym_dir / "TESTUSDT_1d.parquet"
+    df.to_parquet(path, index=False)
+
+    assert v._detect_frozen_periods(path, "TESTUSDT", min_days=2) == []
+
+
+def test_load_ohlcv_gaps(v, tmp_path):
+    ignore = tmp_path / "ignore.json"
+    ignore.write_text(json.dumps({"entries": [
+        {"symbol": "A", "kind": "ohlcv", "gaps": [{"start": "2024-01-01", "end": "2024-01-02"}]},
+        {"symbol": "B", "kind": "funding", "gaps": [{"start": "2024-01-01", "end": "2024-01-02"}]},
+        {"symbol": "C", "kind": "ohlcv", "gaps": [{"start": "2024-02-01", "end": "2024-02-02"}]},
+    ]}), encoding="utf-8")
+
+    gaps = v._load_ohlcv_gaps(ignore)
+    assert len(gaps) == 2
+    assert [g[0] for g in gaps] == ["A", "C"]
+    assert v._load_ohlcv_gaps(tmp_path / "nope.json") == []
+
+
+def test_validate_halt_frozen_and_missing(v, tmp_path):
+    sym_dir = tmp_path / "TESTUSDT"
+    sym_dir.mkdir()
+    times = pd.date_range("2024-01-01", periods=10, freq="1D")
+    vol = [0, 0, 100, 200, 300, 0, 0, 0, 400, 500]
+    high = [10, 10, 12, 13, 14, 9, 9, 9, 15, 16]
+    low = [10, 10, 11, 12, 13, 9, 9, 9, 14, 15]
+    pd.DataFrame({"open_time": times, "high": high, "low": low, "volume": vol}).to_parquet(
+        sym_dir / "TESTUSDT_1d.parquet", index=False
+    )
+
+    ignore = tmp_path / "ignore.json"
+    ignore.write_text(json.dumps({"entries": [
+        {"symbol": "TESTUSDT", "kind": "ohlcv",
+         "gaps": [{"start": "2024-02-01T00:00:00", "end": "2024-02-02T00:00:00"}]},
+    ]}), encoding="utf-8")
+
+    report = v.validate_halt(str(tmp_path), None, ignore_file=ignore, min_days=2)
+
+    assert report["summary"]["frozen_period_count"] == 1
+    assert report["summary"]["missing_period_count"] == 1
+    assert report["summary"]["total_period_count"] == 2
+    assert {p["type"] for p in report["periods"]} == {"frozen", "missing"}
+    frozen = next(p for p in report["periods"] if p["type"] == "frozen")
+    assert frozen["symbol"] == "TESTUSDT"
+    assert frozen["start"] == "2024-01-06T00:00:00"
