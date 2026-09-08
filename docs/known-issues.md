@@ -135,6 +135,27 @@ BTC/ETH 真实 150x、XRP 100x、BCH/LTC/ADA 等 75x、SCR 10x，但 info.json �
 
 ---
 
+## 8. funding 数值列 string 类型残留导致 merge 冲突
+
+**现象**：`GRVTUSDT_fundingRate` 抓取失败，报
+`"Expected bytes, got a 'int' object" / Conversion failed for column funding_interval_hours with type object`。
+
+**根因**：磁盘上旧的 funding parquet 里 `funding_interval_hours`（及 `last_funding_rate`）
+是 string（历史遗留，所有数值列曾用 `dtype=str` 读入并落盘）。后来抓取改成了数值
+（`numeric_cols`），但**只归一化了新抓的数据**，没迁移磁盘上已有的旧列。
+`merge_frames` 里 `pd.concat(existing(string), new(int))` 混成 object，`to_parquet`
+时 pyarrow 推断 schema 失败。只有个别「迁移时还没上线」的新币（如 GRVTUSDT）触发，
+因为它们的 funding 文件全程是 string。
+
+**修复**：`merge_frames` 增加 `numeric_cols` 参数，对数值列做 `pd.to_numeric` 归一化
+（与时间列归一化同套做法）；`process_job` 传入 `dt.numeric_cols`。merge 前两侧都转数值，
+concat 后类型一致，落盘即修复。
+
+**教训**：磁盘旧数据与在线抓取的类型一致性要在 **merge 边界**统一归一化，
+不能只靠上游抓取侧修正——历史遗留的 string 列在 merge 时仍需显式 `to_numeric`。
+
+---
+
 ## 附：忽略清单机制
 
 `output/futures_ignore_continuity.json` 记录所有「已知不可在线补」的 gap（带 reason）。

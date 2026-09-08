@@ -368,6 +368,30 @@ def test_merge_frames_dedups_and_sorts(fut):
     assert len(merged) == 3
 
 
+def test_merge_frames_normalizes_numeric_cols(fut):
+    import pandas as pd
+    # Legacy funding parquets store these as strings; fresh rows are numeric.
+    existing = pd.DataFrame({
+        "calc_time": ["2026-08-31 00:00:00", "2026-08-31 04:00:00"],
+        "funding_interval_hours": ["4", "4"],
+        "last_funding_rate": ["0.0001", "-0.0002"],
+    })
+    new = pd.DataFrame({
+        "calc_time": pd.to_datetime(["2026-08-31 08:00:00"]),
+        "funding_interval_hours": [4],
+        "last_funding_rate": [0.0003],
+    })
+
+    merged = fut.merge_frames(
+        existing, new, "calc_time",
+        numeric_cols=("funding_interval_hours", "last_funding_rate"),
+    )
+
+    assert len(merged) == 3
+    assert merged["funding_interval_hours"].dtype.kind in "iu"     # int, not object
+    assert merged["last_funding_rate"].dtype.kind == "f"           # float, not object
+
+
 def test_merge_datasets_no_existing(fut, tmp_path):
     import pandas as pd
     newf = tmp_path / "new.csv"

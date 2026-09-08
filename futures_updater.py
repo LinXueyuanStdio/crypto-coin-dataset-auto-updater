@@ -325,17 +325,27 @@ def latest_stored_time(path, time_col):
     return None if pd.isna(ts) else ts.to_pydatetime()
 
 
-def merge_frames(existing_df, new_df, time_col):
+def merge_frames(existing_df, new_df, time_col, numeric_cols=()):
     # Normalise all timestamp columns — existing parquets may have
     # string timestamps from migration (which used dtype=str).
     TS_COLS = {'open_time', 'close_time', 'calc_time', 'create_time'}
     new_df = new_df.copy()
     for col in TS_COLS & set(new_df.columns):
         new_df[col] = pd.to_datetime(new_df[col], errors='coerce')
+    # Normalise numeric columns too — legacy funding parquets stored
+    # funding_interval_hours / last_funding_rate as strings, while freshly
+    # fetched rows are numeric. Mixed types in concat would otherwise blow up
+    # pyarrow's schema inference at to_parquet time.
+    for col in numeric_cols:
+        if col in new_df.columns:
+            new_df[col] = pd.to_numeric(new_df[col], errors='coerce')
     if existing_df is not None and len(existing_df):
         existing_df = existing_df.copy()
         for col in TS_COLS & set(existing_df.columns):
             existing_df[col] = pd.to_datetime(existing_df[col], errors='coerce')
+        for col in numeric_cols:
+            if col in existing_df.columns:
+                existing_df[col] = pd.to_numeric(existing_df[col], errors='coerce')
         merged = pd.concat([existing_df, new_df], ignore_index=True)
     else:
         merged = new_df
@@ -849,7 +859,7 @@ def process_job(dt, symbol, interval, data_folder, end_date, last_dt, downloader
     new_rows = len(new_df)
     existing_df = _read_file(data_path)
     existing_rows = len(existing_df) if existing_df is not None else 0
-    merged = merge_frames(existing_df, new_df, dt.time_col)
+    merged = merge_frames(existing_df, new_df, dt.time_col, dt.numeric_cols)
     os.makedirs(os.path.dirname(data_path), exist_ok=True)
     merged.to_parquet(data_path, index=False)
     new_last = pd.to_datetime(merged[dt.time_col], errors="coerce").max()
