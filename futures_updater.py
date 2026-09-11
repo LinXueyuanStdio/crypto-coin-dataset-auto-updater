@@ -970,7 +970,7 @@ def stamp_readme(path):
 
 
 def run_update(data_folder, end_date=None, budget=None, max_workers=None,
-               batch_total=None, batch_index=None):
+               batch_total=None, batch_index=None, symbols_preselected=False):
     if end_date is None:
         end_date = datetime.now(timezone.utc).date() - timedelta(days=1)
     if budget is None:
@@ -991,7 +991,7 @@ def run_update(data_folder, end_date=None, budget=None, max_workers=None,
     all_jobs = build_jobs()
 
     # ---- batch sharding by symbol (stable, idempotent) ----
-    if batch_total > 1:
+    if batch_total > 1 and not symbols_preselected:
         all_symbols = sorted({job.symbol for job in all_jobs})
         # Contiguous sharding: each batch gets a contiguous block of symbols.
         # batch 0 → first 1/N, batch N-1 → last 1/N.
@@ -1008,6 +1008,12 @@ def run_update(data_folder, end_date=None, budget=None, max_workers=None,
         )
     else:
         my_symbols = None
+        if batch_total > 1:
+            logger.info(
+                "Batch %d/%d: %d symbols preselected by COINS; skipping second sharding",
+                batch_index + 1, batch_total,
+                len({job.symbol for job in all_jobs}),
+            )
 
     # Reload index from disk — the wrapper may have pulled other batches'
     # _index.json since startup, making our in-memory copy stale.
@@ -1190,7 +1196,9 @@ def main():
             before, len(SYMBOLS), ", ".join(sorted(wanted)),
         )
 
-    run_update(data_folder)
+    # The workflow has already sharded COINS before selectively pulling LFS
+    # files. Do not shard that subset a second time inside run_update().
+    run_update(data_folder, symbols_preselected=bool(coins_filter))
 
     # ---- master batch responsibilities ----
     # Only the master batch updates shared metadata files (README, meta.json)

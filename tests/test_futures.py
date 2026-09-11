@@ -480,6 +480,33 @@ def test_run_update_respects_budget_and_counts(fut, tmp_path, monkeypatch):
     assert n == 2 and set(processed) == {"1d", "1h"}
 
 
+def test_run_update_does_not_reshard_preselected_symbols(fut, tmp_path, monkeypatch):
+    kl = _by_name(fut, "klines")
+    monkeypatch.setattr(fut, "SYMBOLS", ["AAAUSDT", "BBBUSDT", "CCCUSDT"])
+    monkeypatch.setattr(fut, "DATA_TYPES", [kl])
+    monkeypatch.setattr(fut, "INTERVALS", ["1d"])
+
+    processed = []
+
+    def fake_process(dt, symbol, interval, data_folder, end_date, last_dt, downloader=None):
+        processed.append(symbol)
+        return os.path.join(data_folder, f"{symbol}_{interval}.csv"), _dt.datetime(2026, 7, 8)
+
+    monkeypatch.setattr(fut, "process_job", fake_process)
+    n = fut.run_update(
+        str(tmp_path),
+        end_date=_dt.date(2026, 7, 8),
+        budget=fut.Budget(1000),
+        max_workers=2,
+        batch_total=32,
+        batch_index=17,
+        symbols_preselected=True,
+    )
+
+    assert n == 3
+    assert set(processed) == {"AAAUSDT", "BBBUSDT", "CCCUSDT"}
+
+
 def test_run_update_zero_budget_skips_all(fut, tmp_path, monkeypatch):
     monkeypatch.setattr(fut, "process_job", lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not run")))
     n = fut.run_update(str(tmp_path), end_date=_dt.date(2026, 7, 8), budget=fut.Budget(0), max_workers=2)
