@@ -271,7 +271,11 @@ jobs:
       # Save the cache for the next run
       # ------------------------------------------------------------------
       - name: Save dataset caches
-        if: always() && steps.dataset-repo.outcome == 'success'
+        # A full matrix shares one cache key; only batch 0 should reserve it.
+        # A single-batch manual run may still refresh the cache.
+        if: >-
+          always() && steps.dataset-repo.outcome == 'success' &&
+          (!(github.event_name == 'schedule' || inputs.run_all_batches) || matrix.batch_index == 0)
         uses: ./.github/actions/hf-repo-setup
         with:
           mode: save

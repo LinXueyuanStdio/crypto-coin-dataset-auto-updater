@@ -108,12 +108,16 @@ final_push() {
     # missing on remote (e.g. pushed by another batch, not yet on LFS store).
     export GIT_LFS_SKIP_SMUDGE=1
 
-    # Stash any pending changes (safe — updater has exited)
-    log "Stashing changes …"
-    if git -C "$DATA_DIR" stash 2>&1; then
+    # Stash any pending changes (safe — updater has exited). `git stash`
+    # returns zero even when there is nothing to save, so inspect the worktree
+    # first instead of treating its exit code as proof that a stash exists.
+    if [ -n "$(git -C "$DATA_DIR" status --porcelain)" ]; then
+        log "Stashing changes …"
+        git -C "$DATA_DIR" stash push --include-untracked -m \
+            "futures-update $(date -u +%Y-%m-%dT%H:%M:%SZ)"
         STASHED=true
     else
-        log "Nothing to stash"
+        log "No local changes to stash"
         STASHED=false
     fi
 
