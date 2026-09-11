@@ -12,6 +12,7 @@
 set -euo pipefail
 
 BATCH_COUNT="${BATCH_COUNT:-0}"
+LFS_PULL_TIMEOUT_SEC="${LFS_PULL_TIMEOUT_SEC:-900}"
 
 rm -f /tmp/lfs_pull_ok.txt /tmp/lfs_pull_fail.txt
 touch /tmp/lfs_pull_ok.txt /tmp/lfs_pull_fail.txt
@@ -30,18 +31,30 @@ if [ "$BATCH_COUNT" -eq 0 ]; then
 fi
 
 echo "::group::LFS pull (${BATCH_COUNT} symbols)"
+echo "Per-symbol timeout: ${LFS_PULL_TIMEOUT_SEC}s"
+df -h .
 
 i=0
 echo "$SYMS" | while IFS= read -r sym; do
     [ -z "$sym" ] && continue
     i=$((i + 1))
     printf '  [%d/%d] %s ... ' "$i" "$BATCH_COUNT" "$sym"
-    if git lfs pull --include="${sym}/**" 2>&1; then
+    if timeout --kill-after=30s "${LFS_PULL_TIMEOUT_SEC}s" \
+        git lfs pull --include="${sym}/**" 2>&1; then
         echo "ok" >> /tmp/lfs_pull_ok.txt
     else
         rc=$?
         echo "  ⚠️  ${sym} (exit ${rc})"
         echo "fail" >> /tmp/lfs_pull_fail.txt
+    fi
+
+    # `git lfs pull` keeps a second copy under .git/lfs/objects after
+    # materialising the working-tree file. The updater only needs the latter;
+    # dropping the object cache keeps the runner's peak disk usage bounded.
+    rm -rf .git/lfs/objects
+
+    if [ $((i % 5)) -eq 0 ] || [ "$i" -eq "$BATCH_COUNT" ]; then
+        df -h . | tail -n 1
     fi
 done
 
