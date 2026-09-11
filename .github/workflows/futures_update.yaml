@@ -66,8 +66,9 @@ jobs:
     strategy:
       # A failed shard must not cancel the other independent shards.
       fail-fast: false
-      # Limit aggregate Binance/Hugging Face traffic and push contention.
-      max-parallel: 4
+      # HF applies a shared limit of 1000 LFS API requests per 5 minutes.
+      # Serial batches avoid both that limit and concurrent git rebases.
+      max-parallel: 1
       matrix:
         # Scheduled and explicit full runs process all 32 shards. Other manual
         # dispatches keep the existing single-batch behaviour.

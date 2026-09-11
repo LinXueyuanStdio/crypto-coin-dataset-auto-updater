@@ -68,7 +68,17 @@ push_progress() {
     stage_batch_parquets
 
     if [ -z "$(git -C "$DATA_DIR" diff --cached --name-only)" ]; then
-        log "No changes to push."
+        # A previous push attempt may have committed successfully but failed
+        # during the upload (for example because HF rate-limited LFS). Do not
+        # report success until those already-committed changes reach origin.
+        local ahead
+        ahead=$(git -C "$DATA_DIR" rev-list --count origin/main..HEAD)
+        if [ "$ahead" -gt 0 ]; then
+            log "No new changes; pushing ${ahead} existing local commit(s) …"
+            push_with_retry
+        else
+            log "No changes to push."
+        fi
         return 0
     fi
 
@@ -149,7 +159,14 @@ final_push() {
     git -C "$DATA_DIR" add -A
 
     if [ -z "$(git -C "$DATA_DIR" diff --cached --name-only)" ]; then
-        log "No changes to push."
+        local ahead
+        ahead=$(git -C "$DATA_DIR" rev-list --count origin/main..HEAD)
+        if [ "$ahead" -gt 0 ]; then
+            log "No new changes; pushing ${ahead} existing local commit(s) …"
+            push_with_retry
+        else
+            log "No changes to push."
+        fi
     else
         local commit_msg="auto-save $(date -u +%Y-%m-%dT%H:%M:%SZ)"
         git -C "$DATA_DIR" commit -m "$commit_msg" 2>&1 || true
@@ -178,7 +195,9 @@ push_with_retry() {
 
         # Rate limit — extract Retry-After from HF's 429 response
         if echo "$push_out" | grep -q "429\|rate.limit\|Too Many Requests"; then
-            retry_sec=$(echo "$push_out" | grep -oP 'Retry after \K\d+' | head -1)
+            # grep legitimately returns 1 when HF omits a Retry-After value;
+            # do not let `set -euo pipefail` abort before the fallback delay.
+            retry_sec=$(echo "$push_out" | grep -oP 'Retry after \K\d+' | head -1 || true)
             wait="${retry_sec:-$((attempt * 60))}"
             log "Rate limited — waiting ${wait}s…"
             sleep "$wait"
