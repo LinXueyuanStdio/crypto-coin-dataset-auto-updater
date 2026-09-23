@@ -153,7 +153,7 @@ jobs:
         working-directory: data
         run: |
           echo "::group::Rebuilding _index.json from parquet files …"
-          python3 "${GITHUB_WORKSPACE}/scripts/rebuild_index.py" --futures 2>&1
+          poetry run python "${GITHUB_WORKSPACE}/scripts/rebuild_index.py" --futures 2>&1
           echo "::endgroup::"
 
       # ------------------------------------------------------------------
