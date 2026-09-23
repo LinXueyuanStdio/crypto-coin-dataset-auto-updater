@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import time
 import logging
 import hashlib
@@ -19,6 +20,11 @@ from huggingface_hub import HfApi
 
 # ----- logging (handlers attached lazily in __main__ to keep import side-effect-free) -----
 logger = logging.getLogger("futures_updater")
+
+
+class ExistingDataError(RuntimeError):
+    """Raised when an existing dataset file cannot be safely loaded."""
+
 
 # ----- HTTP session + optional auto-proxy -----
 # A single pooled Session reuses connections (HTTP keep-alive) so high
@@ -313,6 +319,91 @@ def _read_file(path, columns=None):
         except Exception:
             continue
     return None
+
+
+def _read_existing_file(path):
+    """Read an existing series without silently treating corruption as absence.
+
+    A missing file is valid for a newly listed symbol.  An existing file that
+    cannot be read is not: continuing from an empty frame would replace years
+    of history with only the current incremental download.
+    """
+    candidates = [path]
+    if path.endswith(".parquet"):
+        candidates.append(path[:-len(".parquet")] + ".csv")
+    elif path.endswith(".csv"):
+        candidates.append(path[:-len(".csv")] + ".parquet")
+
+    existing = [p for p in candidates if os.path.exists(p)]
+    if not existing:
+        return None
+
+    errors = []
+    for p in existing:
+        try:
+            if _is_lfs_pointer(p):
+                raise ValueError("file is an unresolved Git LFS pointer")
+            if p.endswith(".parquet"):
+                return pd.read_parquet(p)
+            return pd.read_csv(p, dtype=str)
+        except Exception as exc:
+            errors.append(f"{p}: {exc}")
+
+    raise ExistingDataError(
+        "refusing to overwrite unreadable existing data; " + "; ".join(errors)
+    )
+
+
+def _is_lfs_pointer(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read(200).startswith(b"version https://git-lfs.github.com/spec/")
+    except OSError:
+        return False
+
+
+def _validate_history_preserved(existing_df, merged, time_col, path):
+    """Reject a merge that loses any historical time range or unique rows."""
+    if existing_df is None or existing_df.empty:
+        return
+    if time_col not in existing_df or time_col not in merged:
+        raise ExistingDataError(f"{path}: missing required time column {time_col!r}")
+
+    old_times = pd.to_datetime(existing_df[time_col], errors="coerce").dropna()
+    new_times = pd.to_datetime(merged[time_col], errors="coerce").dropna()
+    if old_times.empty:
+        raise ExistingDataError(f"{path}: existing data has no valid {time_col} values")
+    if new_times.empty:
+        raise ExistingDataError(f"{path}: merged data has no valid {time_col} values")
+
+    old_unique = old_times.nunique()
+    if new_times.min() > old_times.min():
+        raise ExistingDataError(
+            f"{path}: historical lower bound moved forward "
+            f"({old_times.min()} -> {new_times.min()})"
+        )
+    if new_times.nunique() < old_unique:
+        raise ExistingDataError(
+            f"{path}: merge lost timestamps "
+            f"({old_unique} existing -> {new_times.nunique()} merged)"
+        )
+
+
+def _atomic_write_parquet(df, path):
+    """Write a parquet beside its destination and atomically replace it."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(path)}.", suffix=".tmp", dir=os.path.dirname(path)
+    )
+    os.close(fd)
+    try:
+        df.to_parquet(tmp_path, index=False)
+        os.replace(tmp_path, path)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
 
 
 def latest_stored_time(path, time_col):
@@ -833,6 +924,13 @@ def process_job(dt, symbol, interval, data_folder, end_date, last_dt, downloader
     data_path = os.path.join(data_folder, out_name)
     label = os.path.splitext(out_name)[0]
 
+    # Fail before downloading (or taking the idempotency shortcut) if Git LFS
+    # did not materialise this tracked file.
+    if os.path.exists(data_path) and _is_lfs_pointer(data_path):
+        raise ExistingDataError(
+            f"{data_path}: existing data is an unresolved Git LFS pointer"
+        )
+
     # ---- idempotency check: re-read index from disk ----
     # Another parallel batch may have already processed this job and its
     # _index.json entry was pulled by the shell wrapper since we last loaded.
@@ -857,11 +955,11 @@ def process_job(dt, symbol, interval, data_folder, end_date, last_dt, downloader
         logger.info("[%s] no new data (%.1fs)", label, elapsed)
         return None
     new_rows = len(new_df)
-    existing_df = _read_file(data_path)
+    existing_df = _read_existing_file(data_path)
     existing_rows = len(existing_df) if existing_df is not None else 0
     merged = merge_frames(existing_df, new_df, dt.time_col, dt.numeric_cols)
-    os.makedirs(os.path.dirname(data_path), exist_ok=True)
-    merged.to_parquet(data_path, index=False)
+    _validate_history_preserved(existing_df, merged, dt.time_col, data_path)
+    _atomic_write_parquet(merged, data_path)
     new_last = pd.to_datetime(merged[dt.time_col], errors="coerce").max()
     elapsed = time.monotonic() - t0
     ts = new_last.strftime("%Y-%m-%d") if new_last is not pd.NaT else "?"

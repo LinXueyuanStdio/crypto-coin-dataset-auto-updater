@@ -57,6 +57,11 @@ on:
         default: false
         type: boolean
 
+# Never let two full updater runs mutate the same Hugging Face repository.
+concurrency:
+  group: futures-dataset-update
+  cancel-in-progress: false
+
 jobs:
   update-futures-dataset:
     name: update-futures-dataset (batch ${{ matrix.batch_index }})
@@ -154,7 +159,7 @@ jobs:
       # ------------------------------------------------------------------
       # Run the futures updater with periodic auto-push (checkpoints)
       # ------------------------------------------------------------------
-      - name: Run the futures dataset update script with retries
+      - name: Run the futures dataset update script
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           DATASET_SLUG: linxy/USDT-M_Perpetual_Futures
@@ -166,17 +171,11 @@ jobs:
           PROXY: ""
           FORCE_FULL_FETCH: ${{ inputs.force_full_fetch || 'false' }}
         run: |
-          max_retries=5
-          retry=0
-          until bash scripts/run_futures_update.sh; do
-            retry=$((retry + 1))
-            if [ "$retry" -ge "$max_retries" ]; then
-              echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] updater failed $retry times, giving up."
-              exit 1
-            fi
-            echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Update failed (attempt $retry/$max_retries), retrying in 30s..."
-            sleep 30
-          done
+          # The wrapper retries transient Git/HF pushes internally. Never
+          # restart the Python updater in-place: a failed rebase may leave LFS
+          # pointers in the worktree, and a second updater pass could mistake
+          # those unreadable files for missing history.
+          bash scripts/run_futures_update.sh
 
       # ------------------------------------------------------------------
       # Generate run summary (always, even on failure)

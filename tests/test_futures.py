@@ -453,6 +453,67 @@ def test_process_job_none_when_no_new_data(fut, tmp_path, monkeypatch):
     assert fut.process_job(kl, "BTCUSDT", "1d", str(tmp_path), _dt.date(2026, 7, 3), None) is None
 
 
+def test_process_job_refuses_to_overwrite_lfs_pointer(fut, tmp_path, monkeypatch):
+    import pandas as pd
+    import pytest
+
+    kl = _by_name(fut, "klines")
+    path = tmp_path / "BTCUSDT" / "BTCUSDT_1d.parquet"
+    path.parent.mkdir()
+    pointer = (
+        "version https://git-lfs.github.com/spec/v1\n"
+        "oid sha256:" + "a" * 64 + "\n"
+        "size 123456\n"
+    )
+    path.write_text(pointer, encoding="utf-8")
+    fetch_called = False
+
+    def unexpected_fetch(*args, **kwargs):
+        nonlocal fetch_called
+        fetch_called = True
+        return pd.DataFrame(
+            {"open_time": pd.to_datetime(["2026-09-10"]), "close": ["1"]}
+        )
+
+    monkeypatch.setattr(
+        fut,
+        "fetch_series",
+        unexpected_fetch,
+    )
+
+    with pytest.raises(fut.ExistingDataError, match="Git LFS pointer"):
+        fut.process_job(
+            kl, "BTCUSDT", "1d", str(tmp_path), _dt.date(2026, 9, 10), None
+        )
+
+    assert path.read_text(encoding="utf-8") == pointer
+    assert fetch_called is False
+
+
+def test_process_job_refuses_to_overwrite_invalid_parquet(fut, tmp_path, monkeypatch):
+    import pandas as pd
+    import pytest
+
+    kl = _by_name(fut, "klines")
+    path = tmp_path / "BTCUSDT" / "BTCUSDT_1d.parquet"
+    path.parent.mkdir()
+    path.write_bytes(b"not parquet")
+    monkeypatch.setattr(
+        fut,
+        "fetch_series",
+        lambda *a, **k: pd.DataFrame(
+            {"open_time": pd.to_datetime(["2026-09-10"]), "close": ["1"]}
+        ),
+    )
+
+    with pytest.raises(fut.ExistingDataError, match="unreadable existing data"):
+        fut.process_job(
+            kl, "BTCUSDT", "1d", str(tmp_path), _dt.date(2026, 9, 10), None
+        )
+
+    assert path.read_bytes() == b"not parquet"
+
+
 def test_ensure_and_stamp_readme(fut, tmp_path):
     p = tmp_path / "README.md"
     fut.ensure_readme(str(p))
