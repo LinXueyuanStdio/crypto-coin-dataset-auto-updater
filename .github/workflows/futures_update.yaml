@@ -169,6 +169,7 @@ jobs:
           PUSH_INTERVAL_SEC: ${{ inputs.push_interval_sec || '60' }}
           PYTHONUNBUFFERED: "1"
           PROXY: ""
+          COINS: ${{ inputs.symbols || '' }}
           FORCE_FULL_FETCH: ${{ inputs.force_full_fetch || 'false' }}
         run: |
           # The wrapper retries transient Git/HF pushes internally. Never
