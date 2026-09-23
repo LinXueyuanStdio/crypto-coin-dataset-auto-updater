@@ -75,7 +75,7 @@ push_progress() {
         ahead=$(git -C "$DATA_DIR" rev-list --count origin/main..HEAD)
         if [ "$ahead" -gt 0 ]; then
             log "No new changes; pushing ${ahead} existing local commit(s) …"
-            push_with_retry
+            push_with_retry false
         else
             log "No changes to push."
         fi
@@ -88,18 +88,12 @@ push_progress() {
         log "Nothing to commit."
         return 0
     fi
-    log "Commit OK, rebasing on origin/main …"
-
-    # Pull --rebase: if conflict, abort and fail. rebase --abort
-    # takes us back to our local commit, so no data is lost.
-    if ! GIT_LFS_SKIP_SMUDGE=1 git -C "$DATA_DIR" pull --rebase origin main; then
-        log "ERROR: rebase conflict — aborting (local data preserved)"
-        git -C "$DATA_DIR" rebase --abort 2>/dev/null || true
-        return 1
-    fi
-
-    log "Pushing …"
-    push_with_retry
+    # The updater is still writing other files, so the worktree is expected to
+    # be dirty. A rebase here cannot be safe; workflow-level serialization
+    # prevents normal push conflicts, and final_push handles synchronization
+    # after the updater exits.
+    log "Commit OK, pushing checkpoint …"
+    push_with_retry false
 }
 
 # ---------------------------------------------------------------------------
@@ -180,6 +174,7 @@ final_push() {
 #   Assumes the working tree is clean (caller has already committed).
 # ---------------------------------------------------------------------------
 push_with_retry() {
+    local allow_rebase="${1:-true}"
     local max_attempts=5
     local attempt=0
 
@@ -204,8 +199,13 @@ push_with_retry() {
             continue
         fi
 
-        # Push conflict — another batch pushed first, rebase and retry
+        # Push conflict — only rebase after the updater has stopped. During a
+        # checkpoint there are normally unstaged files still being written.
         if [ "$attempt" -lt "$max_attempts" ]; then
+            if [ "$allow_rebase" != "true" ]; then
+                log "Push conflict during live update — deferring to final push"
+                return 1
+            fi
             log "Push conflict — rebasing and retrying…"
             GIT_LFS_SKIP_SMUDGE=1 git -C "$DATA_DIR" pull --rebase origin main || {
                 log "Rebase failed — aborting (local data preserved)"
